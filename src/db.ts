@@ -192,13 +192,6 @@ export function initDb(dbPath: string = resolveDbPath()): Database {
   return db;
 }
 
-/** Open the pool read-only (for the observation page). Schema must already exist. */
-export function openReadonly(dbPath: string = resolveDbPath()): Database {
-  const db = new Database(dbPath, { readonly: true });
-  db.exec("PRAGMA foreign_keys = ON;");
-  return db;
-}
-
 // --- ID / slug / time helpers ----------------------------------------------
 
 /** Lowercase, collapse non-alphanumerics to single hyphens, trim. Falls back to "item". */
