@@ -1,0 +1,440 @@
+// server.ts — the six headwater MCP tools.
+//
+// The tool *logic* lives here as plain exported functions (writeConcept, forkConcept,
+// readConcept, readProjectState, openHandoff, returnHandoff). They take a Database plus a
+// snake_case args object that mirrors the tool's input contract exactly, so they can be
+// driven straight from tests without any MCP plumbing. `registerTools` wires each into an
+// McpServer with a zod input schema; `startServer` runs it over a stdio transport.
+//
+// Enforced invariants: concepts are never UPDATEd (a fork is a new row + a lineage edge);
+// the original parent is untouched by a fork; a handoff's payload_snapshot and directive are
+// frozen at creation — only status/returned_at/return_note move in place.
+
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+import { Database } from "bun:sqlite";
+import {
+  initDb,
+  genId,
+  nowIso,
+  slugify,
+  CONCEPT_TYPES,
+  CONCEPT_STATUSES,
+  LINEAGE_KINDS,
+  LINEAGE_REASONS,
+} from "./db.ts";
+import type {
+  ConceptRow,
+  ConceptStatus,
+  ConceptType,
+  HandoffRow,
+  LineageKind,
+  LineageReason,
+  ProjectRow,
+  SurfaceRow,
+} from "./db.ts";
+
+// --- Default kind for surfaces upserted by a write tool (v1 simplification: no tool
+// carries a surface kind yet). See CLAUDE.md.
+const DEFAULT_SURFACE_KIND = "external_agent" as const;
+
+// --- Tool argument contracts (mirror the zod input schemas below) ----------
+
+export interface WriteConceptArgs {
+  project: string;
+  type: ConceptType;
+  title: string;
+  body: string;
+  status?: ConceptStatus;
+  surface: string;
+}
+
+export interface ForkConceptArgs {
+  parent_id: string;
+  body: string;
+  surface: string;
+  kind?: LineageKind;
+  reason?: LineageReason | null;
+  type?: ConceptType;
+  title?: string | null;
+}
+
+export interface OpenHandoffArgs {
+  project: string;
+  from_surface: string;
+  to_surface: string;
+  concept_ids: string[];
+  directive: string;
+}
+
+export interface ReturnHandoffArgs {
+  handoff_id: string;
+  return_note: string;
+}
+
+export interface ProjectState {
+  project: string;
+  exists: boolean;
+  name: string;
+  concepts_by_status: Record<ConceptStatus, ConceptRow[]>;
+  open_handoffs: Array<Record<string, unknown>>;
+  recent_handoffs: Array<Record<string, unknown>>;
+  recent_concepts: ConceptRow[];
+}
+
+// --- Internal helpers -------------------------------------------------------
+
+/** Upsert a project by id = slug(name). First mention wins (name/created_at kept on conflict). */
+function upsertProject(db: Database, project: string): ProjectRow {
+  const id = slugify(project);
+  db.query(
+    `INSERT INTO project (id, name, repo_path, created_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(id) DO NOTHING`,
+  ).run(id, project, null, nowIso());
+  return db.query<ProjectRow, [string]>(`SELECT * FROM project WHERE id = ?`).get(id)!;
+}
+
+/** Upsert a surface by id = slug(id-or-label). Upserted surfaces get the default kind. */
+function upsertSurface(db: Database, surface: string): SurfaceRow {
+  const id = slugify(surface);
+  db.query(
+    `INSERT INTO surface (id, kind, label) VALUES (?, ?, ?)
+     ON CONFLICT(id) DO NOTHING`,
+  ).run(id, DEFAULT_SURFACE_KIND, surface);
+  return db.query<SurfaceRow, [string]>(`SELECT * FROM surface WHERE id = ?`).get(id)!;
+}
+
+function getConcept(db: Database, id: string): ConceptRow | null {
+  return db.query<ConceptRow, [string]>(`SELECT * FROM concept WHERE id = ?`).get(id);
+}
+
+function getHandoff(db: Database, id: string): HandoffRow | null {
+  return db.query<HandoffRow, [string]>(`SELECT * FROM handoff WHERE id = ?`).get(id);
+}
+
+/** Parse a handoff's frozen JSON snapshot back into structured form for presentation. */
+function presentHandoff(row: HandoffRow): Record<string, unknown> {
+  let snapshot: unknown;
+  try {
+    snapshot = JSON.parse(row.payload_snapshot);
+  } catch {
+    snapshot = row.payload_snapshot;
+  }
+  return { ...row, payload_snapshot: snapshot };
+}
+
+// --- The six operations -----------------------------------------------------
+
+/** Create a new immutable concept; origin_surface_id = the calling surface. */
+export function writeConcept(db: Database, args: WriteConceptArgs): ConceptRow {
+  const status: ConceptStatus = args.status ?? "active";
+  const proj = upsertProject(db, args.project);
+  const surf = upsertSurface(db, args.surface);
+  const id = genId(args.title);
+  const createdAt = nowIso();
+  db.query(
+    `INSERT INTO concept (id, project_id, type, title, status, body, origin_surface_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, proj.id, args.type, args.title, status, args.body, surf.id, createdAt);
+  return getConcept(db, id)!;
+}
+
+/**
+ * Fork a parent concept: create a NEW immutable concept (same project as the parent, origin =
+ * the calling surface) plus a lineage edge from the new node (child) to the parent. The parent
+ * row is never modified. Returns the new node.
+ */
+export function forkConcept(db: Database, args: ForkConceptArgs): ConceptRow {
+  const parent = getConcept(db, args.parent_id);
+  if (!parent) throw new Error(`unknown parent concept: ${args.parent_id}`);
+
+  const surf = upsertSurface(db, args.surface);
+  const type: ConceptType = args.type ?? "note";
+  const kind: LineageKind = args.kind ?? "forks_from";
+  const reason: LineageReason | null = args.reason ?? null;
+  const title = args.title ?? parent.title;
+  const status: ConceptStatus = "active";
+  const createdAt = nowIso();
+  const conceptId = genId(title);
+  const lineageId = genId("lineage");
+
+  db.transaction(() => {
+    db.query(
+      `INSERT INTO concept (id, project_id, type, title, status, body, origin_surface_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(conceptId, parent.project_id, type, title, status, args.body, surf.id, createdAt);
+    db.query(
+      `INSERT INTO lineage (id, from_concept_id, to_concept_id, kind, reason, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(lineageId, conceptId, parent.id, kind, reason, createdAt);
+  })();
+
+  return getConcept(db, conceptId)!;
+}
+
+/** Recall a concept by id (a first-class path). Throws if it does not exist. */
+export function readConcept(db: Database, id: string): ConceptRow {
+  const concept = getConcept(db, id);
+  if (!concept) throw new Error(`unknown concept: ${id}`);
+  return concept;
+}
+
+/** Session-kickoff context: concepts grouped by status, pending handoffs, and recents. */
+export function readProjectState(db: Database, project: string): ProjectState {
+  const projectId = slugify(project);
+  const projectRow = db
+    .query<ProjectRow, [string]>(`SELECT * FROM project WHERE id = ?`)
+    .get(projectId);
+
+  const concepts = db
+    .query<ConceptRow, [string]>(`SELECT * FROM concept WHERE project_id = ? ORDER BY created_at ASC`)
+    .all(projectId);
+  const byStatus: Record<ConceptStatus, ConceptRow[]> = {
+    active: [],
+    locked: [],
+    parked: [],
+    resolved: [],
+    discarded: [],
+  };
+  for (const c of concepts) byStatus[c.status].push(c);
+
+  const openHandoffs = db
+    .query<HandoffRow, [string]>(
+      `SELECT * FROM handoff WHERE project_id = ? AND status = 'pending' ORDER BY initiated_at DESC`,
+    )
+    .all(projectId);
+  const recentHandoffs = db
+    .query<HandoffRow, [string]>(
+      `SELECT * FROM handoff WHERE project_id = ? ORDER BY initiated_at DESC LIMIT 10`,
+    )
+    .all(projectId);
+  const recentConcepts = db
+    .query<ConceptRow, [string]>(
+      `SELECT * FROM concept WHERE project_id = ? ORDER BY created_at DESC LIMIT 10`,
+    )
+    .all(projectId);
+
+  return {
+    project: projectId,
+    exists: projectRow !== null,
+    name: projectRow?.name ?? project,
+    concepts_by_status: byStatus,
+    open_handoffs: openHandoffs.map(presentHandoff),
+    recent_handoffs: recentHandoffs.map(presentHandoff),
+    recent_concepts: recentConcepts,
+  };
+}
+
+/**
+ * Open a `pending` handoff carrying the named concepts. `payload_snapshot` is a frozen JSON
+ * copy of those concept rows at this moment; handoff_concept rows record the join.
+ */
+export function openHandoff(db: Database, args: OpenHandoffArgs): HandoffRow {
+  const proj = upsertProject(db, args.project);
+  const fromS = upsertSurface(db, args.from_surface);
+  const toS = upsertSurface(db, args.to_surface);
+
+  const carried: ConceptRow[] = [];
+  for (const cid of args.concept_ids) {
+    const c = getConcept(db, cid);
+    if (!c) throw new Error(`unknown concept in handoff: ${cid}`);
+    carried.push(c);
+  }
+
+  const id = genId("handoff");
+  const initiatedAt = nowIso();
+  const payload = JSON.stringify(carried);
+
+  db.transaction(() => {
+    db.query(
+      `INSERT INTO handoff
+         (id, project_id, from_surface_id, to_surface_id, directive, payload_snapshot, status, initiated_at, returned_at, return_note)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)`,
+    ).run(id, proj.id, fromS.id, toS.id, args.directive, payload, initiatedAt);
+    const insertHc = db.query(
+      `INSERT INTO handoff_concept (handoff_id, concept_id) VALUES (?, ?)`,
+    );
+    for (const c of carried) insertHc.run(id, c.id);
+  })();
+
+  return getHandoff(db, id)!;
+}
+
+/** Move a handoff to `returned`, stamping returned_at and the return note. */
+export function returnHandoff(db: Database, args: ReturnHandoffArgs): HandoffRow {
+  const existing = getHandoff(db, args.handoff_id);
+  if (!existing) throw new Error(`unknown handoff: ${args.handoff_id}`);
+  db.query(
+    `UPDATE handoff SET status = 'returned', returned_at = ?, return_note = ? WHERE id = ?`,
+  ).run(nowIso(), args.return_note, args.handoff_id);
+  return getHandoff(db, args.handoff_id)!;
+}
+
+// --- MCP wiring -------------------------------------------------------------
+
+type ToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+};
+
+function ok(data: unknown): ToolResult {
+  return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+}
+
+function fail(err: unknown): ToolResult {
+  const message = err instanceof Error ? err.message : String(err);
+  return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
+}
+
+/** Register all six tools on the given server, backed by the given pool. */
+export function registerTools(server: McpServer, db: Database): void {
+  server.registerTool(
+    "write_concept",
+    {
+      title: "Write concept",
+      description:
+        "Record a new immutable concept in a project. The concept's origin is the calling surface. " +
+        "Concepts are never edited in place — to change one, fork it.",
+      inputSchema: {
+        project: z.string().describe("Project id or name (upserted on first mention)."),
+        type: z.enum(CONCEPT_TYPES).describe("Kind of concept."),
+        title: z.string().describe("Short human title."),
+        body: z.string().describe("The concept's content."),
+        status: z.enum(CONCEPT_STATUSES).default("active").describe("Lifecycle status."),
+        surface: z.string().describe("Calling surface id or label (upserted)."),
+      },
+    },
+    async (args) => {
+      try {
+        return ok(writeConcept(db, args));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "fork_concept",
+    {
+      title: "Fork concept",
+      description:
+        "Create a new concept derived from a parent, plus a lineage edge from the new node to the " +
+        "parent. The parent is never modified. The fork stays in the parent's project; if no title is " +
+        "given it carries the parent's title.",
+      inputSchema: {
+        parent_id: z.string().describe("Id of the concept being forked."),
+        body: z.string().describe("The new node's content."),
+        surface: z.string().describe("Calling surface id or label (upserted)."),
+        kind: z.enum(LINEAGE_KINDS).default("forks_from").describe("Lineage edge kind."),
+        reason: z
+          .enum(LINEAGE_REASONS)
+          .nullable()
+          .optional()
+          .describe("Why the edge exists (optional)."),
+        type: z.enum(CONCEPT_TYPES).default("note").describe("Type of the new concept."),
+        title: z.string().nullable().optional().describe("Title for the new node (defaults to parent's)."),
+      },
+    },
+    async (args) => {
+      try {
+        return ok(forkConcept(db, args));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "read_concept",
+    {
+      title: "Read concept",
+      description: "Recall a single concept by its id.",
+      inputSchema: {
+        id: z.string().describe("Concept id."),
+      },
+    },
+    async (args) => {
+      try {
+        return ok(readConcept(db, args.id));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "read_project_state",
+    {
+      title: "Read project state",
+      description:
+        "Session-kickoff context for a project: concepts grouped by status, open (pending) handoffs, " +
+        "and recent handoffs and concepts.",
+      inputSchema: {
+        project: z.string().describe("Project id or name."),
+      },
+    },
+    async (args) => {
+      try {
+        return ok(readProjectState(db, args.project));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "open_handoff",
+    {
+      title: "Open handoff",
+      description:
+        "Open a pending handoff from one surface to another carrying a set of concepts. The payload is " +
+        "a frozen JSON snapshot of those concepts at this moment; the directive states what the receiver " +
+        "should do.",
+      inputSchema: {
+        project: z.string().describe("Project id or name."),
+        from_surface: z.string().describe("Originating surface id or label."),
+        to_surface: z.string().describe("Receiving surface id or label."),
+        concept_ids: z.array(z.string()).describe("Concept ids this handoff carries."),
+        directive: z.string().describe("What the receiving surface should do."),
+      },
+    },
+    async (args) => {
+      try {
+        return ok(presentHandoff(openHandoff(db, args)));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "return_handoff",
+    {
+      title: "Return handoff",
+      description: "Mark a handoff as returned, recording a note about what came back.",
+      inputSchema: {
+        handoff_id: z.string().describe("Id of the handoff to return."),
+        return_note: z.string().describe("What the receiver reports back."),
+      },
+    },
+    async (args) => {
+      try {
+        return ok(presentHandoff(returnHandoff(db, args)));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+}
+
+/** Open the default pool, build the MCP server, and serve over stdio. */
+export async function startServer(): Promise<void> {
+  const db = initDb();
+  const server = new McpServer({ name: "headwater", version: "0.1.0" });
+  registerTools(server, db);
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  // stdio is the protocol channel — diagnostics must go to stderr, never stdout.
+  console.error("headwater MCP server running on stdio");
+}
