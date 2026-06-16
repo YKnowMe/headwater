@@ -68,7 +68,46 @@ for the full architecture and scope fence.
 
 ## How to connect
 
-<!-- Completed after the server is verified end-to-end. -->
+headwater is a **stdio** MCP server launched with `bun run`. Point your client at the entry file by
+**absolute path** (so it works regardless of the client's working directory). The pool lives at
+`~/.workspace/pool.db` no matter where the server is started; set `HANDOFF_DATA_DIR` to relocate it.
+
+### Claude Desktop
+
+Edit `claude_desktop_config.json` (Settings → Developer → Edit Config) and add:
+
+```json
+{
+  "mcpServers": {
+    "headwater": {
+      "command": "bun",
+      "args": ["run", "D:\\Repository\\headwater\\src\\index.ts"]
+    }
+  }
+}
+```
+
+On macOS/Linux use a POSIX path, e.g. `"args": ["run", "/Users/you/headwater/src/index.ts"]`. To relocate
+the pool, add `"env": { "HANDOFF_DATA_DIR": "/custom/path" }`. Restart Claude Desktop to pick up the change.
+
+### Claude Code
+
+Add it from the repo root with the CLI (the `--` separates headwater's launch command):
+
+```sh
+claude mcp add headwater -- bun run D:\Repository\headwater\src\index.ts
+```
+
+Equivalently, commit a project-scoped `.mcp.json` with the same shape as the Claude Desktop snippet above.
+Override the pool location with `--env HANDOFF_DATA_DIR=/custom/path`. Verify with `claude mcp list`.
+
+> For local development from the repo root, `bun run start` launches the same server.
+
+### Regenerate the observation page
+
+```sh
+bun run render   # reads the pool and (re)writes ./index.html — open it in a browser
+```
 
 ## License
 
