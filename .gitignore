@@ -1,0 +1,45 @@
+# dependencies (bun install)
+node_modules
+
+# headwater data lives OUTSIDE the repo (default ~/.workspace).
+# Ignore any local pool / data dir and all SQLite files so data never lands in git.
+.workspace/
+*.db
+*.db-shm
+*.db-wal
+
+# generated observation page (produced by `bun run render`)
+index.html
+
+# build output
+out
+dist
+*.tgz
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+*.log
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# editors / OS noise
+.idea
+.vscode
+.DS_Store
+
+# NOTE: bun.lock (the lockfile) is intentionally committed — do not ignore it.

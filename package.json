@@ -1,0 +1,22 @@
+{
+  "name": "headwater",
+  "version": "0.1.0",
+  "description": "Local-first tool that records and makes observable the handoff of state between AI surfaces.",
+  "module": "src/index.ts",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "render": "bun run src/render.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  }
+}
