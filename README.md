@@ -53,12 +53,15 @@ handoff's `payload_snapshot` + `directive` are **frozen at creation** (only its 
 
 ```sh
 bun run start    # start the MCP server (stdio transport)
-bun run render   # read the pool and (re)generate ./index.html
+bun run render   # read the pool and write a static ./index.html
+bun run serve    # live viewer at http://localhost:8765 with a Refresh button (re-renders on click)
 bun test         # run the end-to-end loop smoke test
 ```
 
-Open the generated `index.html` in a browser to observe concepts (grouped by status), the lineage tree,
-and the handoff timeline. The page is read-only — regenerate it on demand with `bun run render`.
+Observe concepts (grouped by status), the lineage tree, and the handoff timeline two ways: open the
+generated static `index.html`, or run `bun run serve` and open the printed URL — there a **Refresh**
+button re-renders the page from the pool on demand (override the port with `HEADWATER_VIEW_PORT`). Both
+are read-only and never mutate pool data.
 
 ## Scope (v1)
 

@@ -1,11 +1,14 @@
 // render.ts — the read-only observation page.
 //
-// Reads the pool and writes a single static index.html: concepts grouped by status, the
-// lineage tree (parent -> branches), and the handoff timeline. Plain HTML/CSS built from
-// template literals — no framework, no client JS, no write actions. Behaviourally read-only:
-// it only issues SELECTs and writes the HTML file; it never mutates pool data.
+// `bun run render` reads the pool and writes a single static index.html (pure HTML/CSS from
+// template literals — no client JS): concepts grouped by status, the lineage tree
+// (parent -> branches), and the handoff timeline.
 //
-// Regenerate on demand:  bun run render
+// `bun run serve` starts a tiny local viewer (Bun.serve) that re-renders the same page from the
+// pool on every request; in that live mode the page carries a single vanilla-JS Refresh button
+// (location.reload()) — no framework. Either way it is read-only: only SELECTs, never mutates pool data.
+//
+// Regenerate the file:  bun run render        Live view:  bun run serve
 
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -181,8 +184,6 @@ function renderHandoffsSection(handoffs: HandoffView[]): string {
   return `<section><h2>Handoffs <span class="count">${handoffs.length}</span></h2><div class="timeline">${rows}</div></section>`;
 }
 
-// --- page assembly ----------------------------------------------------------
-
 const STYLE = `
   :root {
     --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #6b7385;
@@ -195,6 +196,11 @@ const STYLE = `
   header.page { border-bottom: 2px solid var(--accent); padding-bottom: 16px; margin-bottom: 8px; }
   header.page h1 { margin: 0; font-size: 26px; letter-spacing: -0.01em; }
   header.page .tag { color: var(--muted); margin-top: 4px; }
+  .head-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+  .refresh { cursor: pointer; border: 1px solid var(--accent); background: var(--accent); color: #fff;
+    font: inherit; font-size: 13px; font-weight: 600; padding: 8px 14px; border-radius: 8px; white-space: nowrap; }
+  .refresh:hover { background: #245751; border-color: #245751; }
+  .refresh:active { transform: translateY(1px); }
   .generated { color: var(--muted); font-size: 13px; margin: 4px 0 28px; }
   section { margin: 34px 0; }
   section > h2 { font-size: 19px; margin: 0 0 14px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
@@ -241,11 +247,18 @@ const STYLE = `
   .empty { color: var(--muted); font-style: italic; }
 `;
 
-/** Build the full observation page from the current pool contents. */
-export function renderHtml(db: Database): string {
+/**
+ * Build the full observation page from the current pool contents. When `opts.live` is set (the
+ * `bun run serve` viewer), the header gets a vanilla-JS Refresh button that reloads the page,
+ * which re-renders it. The static `bun run render` output omits the button (pure HTML/CSS).
+ */
+export function renderHtml(db: Database, opts: { live?: boolean } = {}): string {
   const concepts = loadConcepts(db);
   const lineage = loadLineage(db);
   const handoffs = loadHandoffs(db);
+  const refreshButton = opts.live
+    ? `<button type="button" class="refresh" onclick="location.reload()" title="Re-render from the pool">&#8635; Refresh</button>`
+    : "";
 
   return `<!doctype html>
 <html lang="en">
@@ -258,8 +271,13 @@ export function renderHtml(db: Database): string {
 <body>
   <div class="wrap">
     <header class="page">
-      <h1>headwater</h1>
-      <div class="tag">the handoff of state between AI surfaces, made observable</div>
+      <div class="head-row">
+        <div>
+          <h1>headwater</h1>
+          <div class="tag">the handoff of state between AI surfaces, made observable</div>
+        </div>
+        ${refreshButton}
+      </div>
     </header>
     <p class="generated">Generated ${fmtTime(nowIso())} · ${concepts.length} concepts · ${lineage.length} lineage edges · ${handoffs.length} handoffs</p>
     ${renderConceptsSection(concepts)}
@@ -269,6 +287,34 @@ export function renderHtml(db: Database): string {
 </body>
 </html>
 `;
+}
+
+const DEFAULT_VIEW_PORT = 8765;
+
+/** Handle a viewer request: re-render the page from the pool on every load. */
+function handleViewerRequest(req: Request, db: Database): Response {
+  const { pathname } = new URL(req.url);
+  if (pathname === "/" || pathname === "/index.html") {
+    return new Response(renderHtml(db, { live: true }), {
+      headers: { "content-type": "text/html; charset=utf-8" },
+    });
+  }
+  return new Response("not found", { status: 404 });
+}
+
+/**
+ * Start a tiny local viewer. Every request — and so every click of the page's Refresh button —
+ * re-renders the page from the current pool. The live counterpart to `bun run render`.
+ */
+export function startViewer(
+  port: number = Number(process.env.HEADWATER_VIEW_PORT ?? DEFAULT_VIEW_PORT),
+) {
+  const db = initDb();
+  const server = Bun.serve({ port, fetch: (req) => handleViewerRequest(req, db) });
+  console.error(
+    `headwater viewer live at http://localhost:${server.port}  —  Refresh re-renders from the pool`,
+  );
+  return server;
 }
 
 /** CLI entry: open the pool, render, and write ./index.html. */
@@ -281,5 +327,9 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
-  await main();
+  if (process.argv[2] === "serve") {
+    startViewer();
+  } else {
+    await main();
+  }
 }

@@ -7,7 +7,8 @@
   "license": "MIT",
   "scripts": {
     "start": "bun run src/index.ts",
-    "render": "bun run src/render.ts"
+    "render": "bun run src/render.ts",
+    "serve": "bun run src/render.ts serve"
   },
   "devDependencies": {
     "@types/bun": "latest"

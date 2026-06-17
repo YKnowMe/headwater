@@ -14,7 +14,10 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
 - `src/db.ts` — schema, idempotent init/connection (`bun:sqlite`), data-dir resolution, id/slug/time helpers.
 - `src/server.ts` — the six MCP tools. Tool logic lives here as exported functions (testable without MCP);
   `startServer()` wires them into an `McpServer` over a stdio transport.
-- `src/render.ts` — reads `pool.db`, writes a single static `index.html` via `Bun.write`. Read-only.
+- `src/render.ts` — reads `pool.db` and writes a static `index.html` via `Bun.write` (`bun run render`).
+  Also `bun run serve`: a tiny `Bun.serve` viewer (a runtime built-in, not a web framework) that re-renders
+  the page from the pool on every request; in that live mode the page carries one vanilla-JS Refresh button
+  (`location.reload()`) — no framework. Read-only either way (only SELECTs; never mutates pool data).
 - `src/index.ts` — entry point; calls `startServer()`.
 - `tests/loop.test.ts` — `bun:test` end-to-end smoke test of the full loop against a temp DB.
 
@@ -53,5 +56,6 @@ cross-reference discovery, no graph-viz library, no design-tool surface, no orch
 abstractions or plugin layers.
 
 ## Run
-- `bun run start` — start the MCP server (stdio). `bun run render` — regenerate `index.html`. `bun test` — tests.
+- `bun run start` — MCP server (stdio). `bun run render` — write `index.html`. `bun run serve` — live viewer
+  with a Refresh button. `bun test` — tests.
 - stdio is the MCP channel: never write to **stdout** from the server; logs go to **stderr**.
