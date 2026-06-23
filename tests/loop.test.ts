@@ -18,6 +18,7 @@ import {
   returnHandoff,
   readProjectState,
 } from "../src/server.ts";
+import { renderHtml } from "../src/render.ts";
 
 let tempDir: string;
 let db: Database;
@@ -163,4 +164,67 @@ test("read_project_state on an unseen project returns empty context, not an erro
   expect(state.concepts_by_status.active).toHaveLength(0);
   expect(state.open_handoffs).toHaveLength(0);
   expect(state.recent_concepts).toHaveLength(0);
+});
+
+// --- render.ts: the observation page groups by project and tames long bodies ---
+
+test("render groups concepts by project and never bleeds across projects", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "headwater", type: "note", title: "HEADWATER_ONLY_TITLE", body: "hw body", surface: "code" });
+  writeConcept(rdb, { project: "threadkey", type: "note", title: "THREADKEY_ONLY_TITLE", body: "tk body", surface: "code" });
+
+  const html = renderHtml(rdb);
+
+  // each project gets its own anchored section
+  const iHw = html.indexOf('id="proj-headwater"');
+  const iTk = html.indexOf('id="proj-threadkey"');
+  expect(iHw).toBeGreaterThan(-1);
+  expect(iTk).toBeGreaterThan(-1);
+  expect(iHw).toBeLessThan(iTk); // sorted by name: headwater before threadkey
+
+  // the bug we are fixing: a project's concept must not appear under another project
+  const hwChunk = html.slice(iHw, iTk);
+  const tkChunk = html.slice(iTk);
+  expect(hwChunk).toContain("HEADWATER_ONLY_TITLE");
+  expect(hwChunk).not.toContain("THREADKEY_ONLY_TITLE");
+  expect(tkChunk).toContain("THREADKEY_ONLY_TITLE");
+  expect(tkChunk).not.toContain("HEADWATER_ONLY_TITLE");
+
+  rdb.close();
+});
+
+test("live viewer scopes to a single project via the `only` filter", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "headwater", type: "note", title: "HEADWATER_ONLY_TITLE", body: "hw", surface: "code" });
+  writeConcept(rdb, { project: "threadkey", type: "note", title: "THREADKEY_ONLY_TITLE", body: "tk", surface: "code" });
+
+  const scoped = renderHtml(rdb, { live: true, only: "threadkey" });
+
+  // only the requested project's section renders
+  expect(scoped).toContain('id="proj-threadkey"');
+  expect(scoped).not.toContain('id="proj-headwater"');
+  expect(scoped).toContain("THREADKEY_ONLY_TITLE");
+  expect(scoped).not.toContain("HEADWATER_ONLY_TITLE");
+
+  rdb.close();
+});
+
+test("long concept bodies collapse and stay bounded; short ones stay plain paragraphs", () => {
+  const rdb = initDb(":memory:");
+  const longBody = "L".repeat(300);
+  writeConcept(rdb, { project: "p", type: "note", title: "LONG_ONE", body: longBody, surface: "code" });
+  writeConcept(rdb, { project: "p", type: "note", title: "SHORT_ONE", body: "short body", surface: "code" });
+
+  const html = renderHtml(rdb);
+
+  // long body -> collapsible disclosure whose full region is height-bounded (no card can dominate)
+  expect(html).toContain('<details class="card-body">');
+  expect(html).toContain('class="body-full"');
+  expect(html).toContain("L".repeat(300)); // full text is still present, just collapsed
+  expect(html).toMatch(/\.body-full[^}]*max-height/); // expanded body is capped via CSS
+
+  // short body -> plain paragraph, no needless disclosure triangle
+  expect(html).toContain('<p class="card-body">short body</p>');
+
+  rdb.close();
 });

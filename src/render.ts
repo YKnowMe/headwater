@@ -41,6 +41,22 @@ function badge(text: string, className: string): string {
   return `<span class="badge ${className}">${esc(text)}</span>`;
 }
 
+/** Collapse internal whitespace so a CSS line-clamp truncates clean single-spaced text. */
+function flatPreview(body: string): string {
+  return body.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Render a concept body. Short bodies stay a plain paragraph; long ones (> BODY_CLAMP chars) become a
+ * native <details> disclosure: a line-clamped preview that expands in place to the full, height-capped
+ * body — so one huge concept can never dominate the page. No JS — <details>/<summary> + CSS only.
+ */
+const BODY_CLAMP = 280;
+function renderBody(body: string): string {
+  if (body.length <= BODY_CLAMP) return `<p class="card-body">${esc(body)}</p>`;
+  return `<details class="card-body"><summary class="body-summary">${esc(flatPreview(body))}</summary><div class="body-full">${esc(body)}</div></details>`;
+}
+
 // --- data access ------------------------------------------------------------
 
 function loadConcepts(db: Database): ConceptView[] {
@@ -89,7 +105,7 @@ function renderConceptCard(c: ConceptView): string {
         ${badge(c.type, "type")}
         <h3 class="card-title">${esc(c.title)}</h3>
       </div>
-      <p class="card-body">${esc(c.body)}</p>
+      ${renderBody(c.body)}
       <div class="meta">
         <code class="id">${esc(c.id)}</code>
         <span>origin: ${esc(c.origin_label)}</span>
@@ -184,6 +200,72 @@ function renderHandoffsSection(handoffs: HandoffView[]): string {
   return `<section><h2>Handoffs <span class="count">${handoffs.length}</span></h2><div class="timeline">${rows}</div></section>`;
 }
 
+// --- project grouping -------------------------------------------------------
+// The pool is shared across projects; the page must not commingle them. Partition every loaded row
+// into per-project buckets and render one collapsible section each, so a concept can never appear
+// under another project's heading.
+
+type ProjectBucket = { id: string; name: string; concepts: ConceptView[]; edges: LineageView[]; handoffs: HandoffView[] };
+
+/**
+ * Bucket concepts/lineage/handoffs by project, sorted by project name. Concepts and handoffs carry
+ * `project_id` directly; lineage edges do not, so each is attributed to its child concept's project —
+ * safe because the fork invariant keeps a child and its parent in the same project.
+ */
+function groupByProject(concepts: ConceptView[], lineage: LineageView[], handoffs: HandoffView[]): ProjectBucket[] {
+  const names = new Map<string, string>();
+  const projectOfConcept = new Map<string, string>();
+  for (const c of concepts) {
+    names.set(c.project_id, c.project_name);
+    projectOfConcept.set(c.id, c.project_id);
+  }
+  for (const h of handoffs) if (!names.has(h.project_id)) names.set(h.project_id, h.project_name);
+
+  const buckets = new Map<string, ProjectBucket>();
+  const bucket = (pid: string): ProjectBucket => {
+    let b = buckets.get(pid);
+    if (!b) {
+      b = { id: pid, name: names.get(pid) ?? pid, concepts: [], edges: [], handoffs: [] };
+      buckets.set(pid, b);
+    }
+    return b;
+  };
+  for (const c of concepts) bucket(c.project_id).concepts.push(c);
+  for (const h of handoffs) bucket(h.project_id).handoffs.push(h);
+  for (const e of lineage) {
+    const pid = projectOfConcept.get(e.from_concept_id);
+    if (pid) bucket(pid).edges.push(e);
+  }
+  return [...buckets.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** One project's whole slice: a collapsible section wrapping its concepts, lineage, and handoffs. */
+function renderProjectSection(p: ProjectBucket, opts: { live?: boolean }): string {
+  const counts = `${p.concepts.length}c · ${p.edges.length}l · ${p.handoffs.length}h`;
+  const focus = opts.live ? ` <a class="focus" href="/?project=${encodeURIComponent(p.id)}">focus</a>` : "";
+  return `
+    <details class="project" id="proj-${esc(p.id)}" open>
+      <summary><span class="proj-name">${esc(p.name)}</span> <span class="count">${counts}</span>${focus}</summary>
+      ${renderConceptsSection(p.concepts)}
+      ${renderLineageSection(p.edges)}
+      ${renderHandoffsSection(p.handoffs)}
+    </details>`;
+}
+
+/** The project switcher row: jump-anchors in the static file, ?project= links in the live viewer. */
+function renderProjectIndex(projects: ProjectBucket[], opts: { live?: boolean; only?: string }): string {
+  if (projects.length < 2) return "";
+  const chips = projects
+    .map((p) => {
+      const href = opts.live ? `/?project=${encodeURIComponent(p.id)}` : `#proj-${esc(p.id)}`;
+      const active = opts.only === p.id ? " active" : "";
+      return `<a class="proj-chip${active}" href="${href}">${esc(p.name)}</a>`;
+    })
+    .join("");
+  const allLink = opts.live && opts.only ? `<a class="proj-chip" href="/">all projects</a>` : "";
+  return `<nav class="proj-index">${chips}${allLink}</nav>`;
+}
+
 const STYLE = `
   :root {
     --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #6b7385;
@@ -245,6 +327,33 @@ const STYLE = `
   .directive { margin: 8px 0 10px; color: #333a48; }
   .return-note { margin: 10px 0 0; padding: 8px 12px; background: #f3f6f5; border-radius: 8px; font-size: 14px; }
   .empty { color: var(--muted); font-style: italic; }
+
+  /* Per-project sections: the shared pool's projects are visually contained, not commingled. */
+  .proj-index { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 26px; }
+  .proj-chip { font-size: 13px; padding: 4px 11px; border: 1px solid var(--line); border-radius: 999px;
+    background: var(--panel); color: var(--accent); text-decoration: none; }
+  .proj-chip:hover { border-color: var(--accent); }
+  .proj-chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  details.project { border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
+    padding: 4px 20px 12px; margin: 22px 0; }
+  details.project > summary { font-size: 18px; font-weight: 700; cursor: pointer; list-style: none;
+    display: flex; align-items: center; gap: 12px; padding: 12px 0; }
+  details.project > summary::-webkit-details-marker { display: none; }
+  details.project .proj-name::before { content: "\\25B8  "; color: var(--muted); }
+  details.project[open] > summary .proj-name::before { content: "\\25BE  "; }
+  details.project .focus { margin-left: auto; font-size: 12px; font-weight: 600;
+    color: var(--accent); text-decoration: none; }
+  details.project > section:first-of-type { margin-top: 6px; }
+
+  /* Long concept bodies: collapsed to a clamped preview; expanded body is height-capped so no single
+     concept can dominate the page. Native <details> + CSS line-clamp — no JS. */
+  details.card-body { margin: 8px 0 10px; }
+  details.card-body > summary { color: #333a48; white-space: pre-wrap; cursor: pointer; list-style: none;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  details.card-body > summary::-webkit-details-marker { display: none; }
+  details.card-body > summary::after { content: " \\2026 more"; color: var(--muted); font-size: 12px; }
+  details.card-body[open] > summary { display: none; }
+  details.card-body .body-full { color: #333a48; white-space: pre-wrap; max-height: 60vh; overflow: auto; }
 `;
 
 /**
@@ -252,13 +361,23 @@ const STYLE = `
  * `bun run serve` viewer), the header gets a vanilla-JS Refresh button that reloads the page,
  * which re-renders it. The static `bun run render` output omits the button (pure HTML/CSS).
  */
-export function renderHtml(db: Database, opts: { live?: boolean } = {}): string {
+export function renderHtml(db: Database, opts: { live?: boolean; only?: string } = {}): string {
   const concepts = loadConcepts(db);
   const lineage = loadLineage(db);
   const handoffs = loadHandoffs(db);
   const refreshButton = opts.live
     ? `<button type="button" class="refresh" onclick="location.reload()" title="Re-render from the pool">&#8635; Refresh</button>`
     : "";
+
+  // Group by project so the shared pool's projects never commingle. The static render shows every
+  // project; the live viewer can scope to one via ?project= (opts.only), with a switcher to the rest.
+  const projects = groupByProject(concepts, lineage, handoffs);
+  const shown = opts.only ? projects.filter((p) => p.id === opts.only) : projects;
+  const projectIndex = renderProjectIndex(projects, opts);
+  const sections =
+    shown.length > 0
+      ? shown.map((p) => renderProjectSection(p, opts)).join("")
+      : `<p class="empty">Nothing in the pool yet.</p>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -280,9 +399,8 @@ export function renderHtml(db: Database, opts: { live?: boolean } = {}): string 
       </div>
     </header>
     <p class="generated">Generated ${fmtTime(nowIso())} · ${concepts.length} concepts · ${lineage.length} lineage edges · ${handoffs.length} handoffs</p>
-    ${renderConceptsSection(concepts)}
-    ${renderLineageSection(lineage)}
-    ${renderHandoffsSection(handoffs)}
+    ${projectIndex}
+    ${sections}
   </div>
 </body>
 </html>
@@ -293,9 +411,11 @@ const DEFAULT_VIEW_PORT = 8765;
 
 /** Handle a viewer request: re-render the page from the pool on every load. */
 function handleViewerRequest(req: Request, db: Database): Response {
-  const { pathname } = new URL(req.url);
-  if (pathname === "/" || pathname === "/index.html") {
-    return new Response(renderHtml(db, { live: true }), {
+  const url = new URL(req.url);
+  if (url.pathname === "/" || url.pathname === "/index.html") {
+    // ?project=<id> scopes the page to one project (server-side; no client JS). Absent -> all projects.
+    const only = url.searchParams.get("project") ?? undefined;
+    return new Response(renderHtml(db, { live: true, only }), {
       headers: { "content-type": "text/html; charset=utf-8" },
     });
   }
