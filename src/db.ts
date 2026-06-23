@@ -175,10 +175,28 @@ function schemaSql(): string {
 
 // --- Connection / init ------------------------------------------------------
 
+/** Bump when the schema changes. Gates one-time DDL via PRAGMA user_version. */
+const SCHEMA_VERSION = 1;
+
+/**
+ * Create the schema exactly once per pool, atomically. The pool is shared across processes (one MCP
+ * server per session), so a version gate means only the first opener ever runs DDL — every later
+ * open skips it, taking no write lock. Without this, concurrent opens on a fresh pool interleave
+ * their CREATE statements and one connection sees a half-built schema ("no such table"), crashing it.
+ */
+function ensureSchema(db: Database): void {
+  const current = db.query<{ user_version: number }, []>(`PRAGMA user_version`).get();
+  if ((current?.user_version ?? 0) >= SCHEMA_VERSION) return; // already initialized — no DDL, no lock
+  db.transaction(() => {
+    db.exec(schemaSql());
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
+  })();
+}
+
 /**
  * Open (creating if needed) the pool at `dbPath` and ensure the schema exists.
- * Idempotent: safe to call on every startup. Pass `":memory:"` or a temp path in tests.
- * Defaults to the resolved pool path; creates the data directory when it is a real file.
+ * Idempotent: safe to call on every startup, including concurrently from multiple processes.
+ * Pass `":memory:"` or a temp path in tests. Creates the data directory when it is a real file.
  */
 export function initDb(dbPath: string = resolveDbPath()): Database {
   if (dbPath !== ":memory:") {
@@ -186,9 +204,12 @@ export function initDb(dbPath: string = resolveDbPath()): Database {
     mkdirSync(dir, { recursive: true });
   }
   const db = new Database(dbPath, { create: true });
+  // The pool is shared by every session's MCP server. Wait for a contended lock (up to 5s) instead
+  // of erroring immediately, so sustained write bursts across processes serialize rather than crash.
+  db.exec("PRAGMA busy_timeout = 5000;");
   db.exec("PRAGMA foreign_keys = ON;");
   db.exec("PRAGMA journal_mode = WAL;");
-  db.exec(schemaSql());
+  ensureSchema(db);
   return db;
 }
 

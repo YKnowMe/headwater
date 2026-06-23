@@ -228,3 +228,33 @@ test("long concept bodies collapse and stay bounded; short ones stay plain parag
 
   rdb.close();
 });
+
+// --- db.ts: the shared pool must survive concurrent opens by multiple server processes ---
+
+test("initDb sets a busy_timeout so concurrent processes wait for the lock instead of crashing", () => {
+  const probe = initDb(":memory:");
+  const row = probe.query<{ timeout: number }, []>("PRAGMA busy_timeout").get()!;
+  expect(row.timeout).toBeGreaterThan(0);
+  probe.close();
+});
+
+test("initDb stamps a schema version and re-initialising an existing pool runs no DDL (lock-free)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "headwater-init-"));
+  const path = join(dir, "pool.db");
+  const a = initDb(path);
+  // schema is marked initialized, so future opens can skip DDL entirely
+  const v = a.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+  expect(v).toBeGreaterThan(0);
+
+  // hold a write lock, then open the SAME (already-initialized) pool: it must not need a write
+  // lock (no DDL) and must not throw — this is what a second server process does.
+  a.exec("BEGIN IMMEDIATE");
+  a.query("INSERT INTO surface (id, kind, label) VALUES ('lockholder', 'operator', 'lock')").run();
+  expect(() => {
+    const b = initDb(path);
+    b.close();
+  }).not.toThrow();
+  a.exec("ROLLBACK");
+  a.close();
+  rmSync(dir, { recursive: true, force: true });
+});
