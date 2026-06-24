@@ -223,9 +223,77 @@ test("long concept bodies collapse and stay bounded; short ones stay plain parag
   expect(html).toContain("L".repeat(300)); // full text is still present, just collapsed
   expect(html).toMatch(/\.body-full[^}]*max-height/); // expanded body is capped via CSS
 
-  // short body -> plain paragraph, no needless disclosure triangle
-  expect(html).toContain('<p class="card-body">short body</p>');
+  // short body -> plain card-body container (no needless disclosure triangle)
+  expect(html).toContain('<div class="card-body">short body</div>');
 
+  rdb.close();
+});
+
+// --- render.ts: rich concept bodies (escape-first markdown subset + mermaid) ---
+
+test("rich body renders image URLs as <img>; non-http schemes never reach an attribute", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "p", type: "note", title: "img", body: "see ![d](https://ex.com/a.png) ok", surface: "s" });
+  writeConcept(rdb, { project: "p", type: "note", title: "bad", body: "x ![e](javascript:alert(1)) y", surface: "s" });
+  const html = renderHtml(rdb);
+  expect(html).toContain('<img src="https://ex.com/a.png"');
+  expect(html).toContain('loading="lazy"');
+  expect(html).not.toContain('src="javascript:');
+  expect(html).not.toContain('href="javascript:');
+  rdb.close();
+});
+
+test("rich body renders bold, code, http links, and pipe tables", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "p", type: "note", title: "fmt", body: "**bold** and `code` and [t](https://ex.com)", surface: "s" });
+  writeConcept(rdb, { project: "p", type: "note", title: "tbl", body: "| a | b |\n| - | - |\n| 1 | 2 |", surface: "s" });
+  const html = renderHtml(rdb);
+  expect(html).toContain("<b>bold</b>");
+  expect(html).toContain("<code>code</code>");
+  expect(html).toContain('<a href="https://ex.com" rel="noopener noreferrer"');
+  expect(html).toContain('<table class="md">');
+  rdb.close();
+});
+
+test("rich body is injection-safe: raw HTML in a body is escaped, never executable", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "p", type: "note", title: "xss", body: '<script>alert(1)</script> <img src=x onerror=alert(2)>', surface: "s" });
+  const html = renderHtml(rdb);
+  expect(html).not.toContain("<script>alert(1)"); // no raw script tag
+  expect(html).not.toContain("<img src=x onerror"); // no raw injected img
+  expect(html).toContain("&lt;script&gt;"); // it is escaped text
+  rdb.close();
+});
+
+test("rich body blocks js-scheme and attribute-breakout injection vectors", () => {
+  const rdb = initDb(":memory:");
+  const nasties = [
+    "[x](javascript:alert(1))",
+    "![y](javascript:alert(2))",
+    '[z](https://e.com" onmouseover="alert(3))',
+    '![w](https://e.com/"><script>alert(4)</script>)',
+    'plain <b onclick="x">no</b> and <a href="javascript:1">no</a>',
+  ];
+  nasties.forEach((b, i) => writeConcept(rdb, { project: "p", type: "note", title: `n${i}`, body: b, surface: "s" }));
+  const html = renderHtml(rdb); // static => no mermaid <script> to confuse the assertions
+  expect(html).not.toContain('href="javascript:');
+  expect(html).not.toContain('src="javascript:');
+  expect(html).not.toContain('onmouseover="alert');
+  expect(html).not.toContain('onclick="x"');
+  expect(html).not.toContain("<script>alert(4)");
+  rdb.close();
+});
+
+test("mermaid blocks render live as <pre class=\"mermaid\"> with the script; static as a code block", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "p", type: "note", title: "m", body: "```mermaid\ngraph TD; A-->B;\n```", surface: "s" });
+  const live = renderHtml(rdb, { live: true });
+  const stat = renderHtml(rdb);
+  expect(live).toContain('<pre class="mermaid">');
+  expect(live).toContain("/vendor/mermaid.min.js");
+  expect(stat).not.toContain('<pre class="mermaid">');
+  expect(stat).toContain('class="code-block"');
+  expect(stat).not.toContain("/vendor/mermaid.min.js");
   rdb.close();
 });
 

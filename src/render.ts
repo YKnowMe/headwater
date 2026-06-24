@@ -56,10 +56,79 @@ function clip(s: string, n: number): string {
  * native <details> disclosure: a line-clamped preview that expands in place to the full, height-capped
  * body — so one huge concept can never dominate the page. No JS — <details>/<summary> + CSS only.
  */
+// --- rich concept bodies: escape-first markdown subset + mermaid (the recorded carve-out) ----------
+// SECURITY: esc() the text FIRST, then re-introduce ONLY a fixed whitelist of tags we construct
+// ourselves. Every dynamic value (alt, link text, code, cell, heading, URL) comes from already-escaped
+// text, so no raw "/'/</> survive — the page can never receive raw HTML/SVG from a concept body. URLs
+// must start http(s):// (javascript:/data: are left as inert text, never an attribute).
+
+/** Inline formatting on one line. Escapes first; nothing below can introduce a raw `<` or `"`. */
+function inline(raw: string): string {
+  let s = esc(raw);
+  s = s.replace(/!\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g,
+    (_m, alt, url) => `<img src="${url}" alt="${alt}" loading="lazy" referrerpolicy="no-referrer">`);
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+    (_m, text, url) => `<a href="${url}" rel="noopener noreferrer" target="_blank">${text}</a>`);
+  s = s.replace(/`([^`]+)`/g, (_m, c) => `<code>${c}</code>`);
+  s = s.replace(/\*\*([^*]+)\*\*/g, (_m, t) => `<b>${t}</b>`);
+  s = s.replace(/\*([^*\s][^*]*)\*/g, (_m, t) => `<i>${t}</i>`);
+  return s;
+}
+
+function splitCells(row: string): string[] {
+  return row.replace(/^\s*\|?/, "").replace(/\|?\s*$/, "").split("|").map((c) => c.trim());
+}
+
+function renderMdTable(header: string[], rows: string[][]): string {
+  const th = header.map((c) => `<th>${inline(c)}</th>`).join("");
+  const trs = rows.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("");
+  return `<table class="md"><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table>`;
+}
+
+/**
+ * Render a concept body: images (http(s) only), http links, bold/italic/code, headings, pipe-tables,
+ * and fenced blocks. A ```mermaid block becomes a live <pre class="mermaid"> (rendered client-side by
+ * the vendored strict Mermaid) when `live`, else a static code block. See the CLAUDE.md carve-out.
+ */
+function renderRichBody(body: string, live: boolean): string {
+  const lines = body.split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    const fence = /^```(\w*)\s*$/.exec(line.trim());
+    if (fence) {
+      const lang = fence[1]!.toLowerCase();
+      const buf: string[] = [];
+      i++;
+      while (i < lines.length && lines[i]!.trim() !== "```") { buf.push(lines[i]!); i++; }
+      i++; // skip closing fence
+      const src = esc(buf.join("\n"));
+      out.push(lang === "mermaid" && live ? `<pre class="mermaid">${src}</pre>` : `<pre class="code-block">${src}</pre>`);
+      continue;
+    }
+    const next = lines[i + 1] ?? "";
+    if (line.includes("|") && next.includes("|") && /^[\s|:-]*-[\s|:-]*$/.test(next)) {
+      const header = splitCells(line);
+      i += 2; // header + separator
+      const rows: string[][] = [];
+      while (i < lines.length && lines[i]!.includes("|") && lines[i]!.trim() !== "") { rows.push(splitCells(lines[i]!)); i++; }
+      out.push(renderMdTable(header, rows));
+      continue;
+    }
+    const hm = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (hm) { out.push(`<h4 class="md-h">${inline(hm[2]!)}</h4>`); i++; continue; }
+    out.push(inline(line));
+    i++;
+  }
+  return out.join("\n");
+}
+
 const BODY_CLAMP = 280;
-function renderBody(body: string): string {
-  if (body.length <= BODY_CLAMP) return `<p class="card-body">${esc(body)}</p>`;
-  return `<details class="card-body"><summary class="body-summary">${esc(flatPreview(body))}</summary><div class="body-full">${esc(body)}</div></details>`;
+function renderBody(body: string, live: boolean): string {
+  const rich = renderRichBody(body, live);
+  if (body.length <= BODY_CLAMP) return `<div class="card-body">${rich}</div>`;
+  return `<details class="card-body"><summary class="body-summary">${esc(flatPreview(body))}</summary><div class="body-full">${rich}</div></details>`;
 }
 
 // --- data access ------------------------------------------------------------
@@ -103,14 +172,14 @@ function loadHandoffs(db: Database): HandoffView[] {
 
 // --- section renderers ------------------------------------------------------
 
-function renderConceptCard(c: ConceptView): string {
+function renderConceptCard(c: ConceptView, live: boolean): string {
   return `
     <article class="card">
       <div class="card-head">
         ${badge(c.type, "type")}
         <h3 class="card-title">${esc(c.title)}</h3>
       </div>
-      ${renderBody(c.body)}
+      ${renderBody(c.body, live)}
       <div class="meta">
         <code class="id">${esc(c.id)}</code>
         <span>origin: ${esc(c.origin_label)}</span>
@@ -124,15 +193,15 @@ function renderConceptCard(c: ConceptView): string {
 // more" disclosure so a 200-concept group can't blow out the page (every card stays one click away).
 const CARD_CAP = 12;
 
-function renderCards(items: ConceptView[]): string {
-  const cards = items.map(renderConceptCard);
+function renderCards(items: ConceptView[], live: boolean): string {
+  const cards = items.map((c) => renderConceptCard(c, live));
   if (cards.length <= CARD_CAP) return `<div class="cards">${cards.join("")}</div>`;
   const head = cards.slice(0, CARD_CAP).join("");
   const rest = cards.slice(CARD_CAP).join("");
   return `<div class="cards">${head}</div><details class="more"><summary>Show ${cards.length - CARD_CAP} more</summary><div class="cards">${rest}</div></details>`;
 }
 
-function renderConceptsSection(concepts: ConceptView[]): string {
+function renderConceptsSection(concepts: ConceptView[], live: boolean): string {
   if (concepts.length === 0) {
     return `<section><h2>Concepts</h2><p class="empty">No concepts yet.</p></section>`;
   }
@@ -142,7 +211,7 @@ function renderConceptsSection(concepts: ConceptView[]): string {
     return `
       <div class="status-group">
         <h3 class="status-head">${badge(status, `st-${status}`)} <span class="count">${items.length}</span></h3>
-        ${renderCards(items)}
+        ${renderCards(items, live)}
       </div>`;
   }).join("");
   return `<section><h2>Concepts <span class="count">${concepts.length}</span></h2>${groups}</section>`;
@@ -440,7 +509,7 @@ function renderProjectSection(p: ProjectBucket, opts: { live?: boolean }, open: 
   return `
     <details class="project" id="proj-${esc(p.id)}"${open ? " open" : ""}>
       <summary><span class="proj-name">${esc(p.name)}</span> <span class="count">${counts}</span>${focus}</summary>
-      ${renderConceptsSection(p.concepts)}
+      ${renderConceptsSection(p.concepts, !!opts.live)}
       ${renderMatrix(p.concepts)}
       ${renderLineageSection(p.edges, p.id)}
       ${renderHandoffsSection(p.handoffs, p.id)}
@@ -609,6 +678,20 @@ const STYLE = `
   .tl-open { fill: var(--accent); }
   .tl-ret { fill: #ffffff; stroke: var(--accent); stroke-width: 1.5; }
   .tl-label { font-size: 11px; fill: var(--ink); }
+
+  /* Rich concept bodies: escape-first markdown subset + mermaid (the carve-out). */
+  .card-body img, .body-full img { max-width: 100%; height: auto; display: block;
+    border: 1px solid var(--line); border-radius: 8px; margin: 8px 0; }
+  .card-body a, .body-full a { color: var(--accent); }
+  .card-body code, .body-full code, td code, th code { background: #eef1f4; padding: 1px 5px;
+    border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  h4.md-h { font-size: 14px; margin: 12px 0 4px; }
+  table.md { margin: 8px 0; }
+  pre.mermaid { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px; margin: 8px 0; overflow: auto; }
+  pre.code-block { background: #0f172a; color: #e2e8f0; padding: 10px 12px; border-radius: 8px;
+    margin: 8px 0; overflow: auto; white-space: pre;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
 `;
 
 /**
@@ -622,6 +705,11 @@ export function renderHtml(db: Database, opts: { live?: boolean; only?: string }
   const handoffs = loadHandoffs(db);
   const refreshButton = opts.live
     ? `<button type="button" class="refresh" onclick="location.reload()" title="Re-render from the pool">&#8635; Refresh</button>`
+    : "";
+  // Live viewer only: load the vendored Mermaid and render ```mermaid blocks with securityLevel strict.
+  // The static file carries no script (it shows mermaid source as a code block). See the CLAUDE.md carve-out.
+  const mermaidScript = opts.live
+    ? `\n  <script src="/vendor/mermaid.min.js"></script>\n  <script>mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" }); mermaid.run({ querySelector: ".mermaid" });</script>`
     : "";
 
   // Group by project so the shared pool's projects never commingle. The static render shows every
@@ -665,7 +753,7 @@ export function renderHtml(db: Database, opts: { live?: boolean; only?: string }
     </div>
     ${schemaPanel}
     ${sections}
-  </div>
+  </div>${mermaidScript}
 </body>
 </html>
 `;
@@ -676,6 +764,12 @@ const DEFAULT_VIEW_PORT = 8765;
 /** Handle a viewer request: re-render the page from the pool on every load. */
 function handleViewerRequest(req: Request, db: Database): Response {
   const url = new URL(req.url);
+  if (url.pathname === "/vendor/mermaid.min.js") {
+    // Serve the vendored Mermaid bundle locally (no CDN) so diagrams render offline.
+    return new Response(Bun.file(join(import.meta.dir, "..", "vendor", "mermaid.min.js")), {
+      headers: { "content-type": "text/javascript; charset=utf-8" },
+    });
+  }
   if (url.pathname === "/" || url.pathname === "/index.html") {
     // ?project=<id> scopes the page to one project (server-side; no client JS). Absent -> all projects.
     const only = url.searchParams.get("project") ?? undefined;
