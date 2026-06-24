@@ -304,3 +304,42 @@ test("render caps a long status group and tucks the rest behind 'show more'", ()
   expect(html).toContain("Show 3 more"); // 15 - 12 cap
   rdb.close();
 });
+
+// --- render.ts Phase 2: tables, inline-SVG diagrams, schema panel (collapsed on-demand views) ---
+
+test("render includes a schema panel listing the six tables with live counts", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "p", type: "note", title: "A", body: "a", surface: "s" });
+  const html = renderHtml(rdb);
+  expect(html).toContain('<details class="schema">');
+  expect(html).toContain("<code>handoff_concept</code>"); // unique to the schema panel
+  rdb.close();
+});
+
+test("render adds a lineage SVG diagram and an adjacency table when edges exist", () => {
+  const rdb = initDb(":memory:");
+  const parent = writeConcept(rdb, { project: "p", type: "decision", title: "Parent", body: "p", surface: "s" });
+  forkConcept(rdb, { parent_id: parent.id, body: "child body", surface: "s", title: "Child" });
+  const html = renderHtml(rdb);
+  expect(html).toContain('class="lineage-svg"');
+  expect(html).toContain('<table class="ltbl">');
+  rdb.close();
+});
+
+test("render adds a handoff table and an SVG timeline when handoffs exist", () => {
+  const rdb = initDb(":memory:");
+  const a = writeConcept(rdb, { project: "p", type: "note", title: "A", body: "a", surface: "s1" });
+  openHandoff(rdb, { project: "p", from_surface: "s1", to_surface: "s2", concept_ids: [a.id], directive: "do x" });
+  const html = renderHtml(rdb);
+  expect(html).toContain('<table class="htbl">');
+  expect(html).toContain('class="timeline-svg"');
+  rdb.close();
+});
+
+test("render adds a type x status matrix per project", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "p", type: "decision", title: "A", body: "a", surface: "s", status: "active" });
+  const html = renderHtml(rdb);
+  expect(html).toContain('<table class="matrix">');
+  rdb.close();
+});

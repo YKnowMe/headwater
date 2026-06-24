@@ -12,7 +12,7 @@
 
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { initDb, nowIso, CONCEPT_STATUSES } from "./db.ts";
+import { initDb, nowIso, CONCEPT_STATUSES, CONCEPT_TYPES } from "./db.ts";
 import type { ConceptRow, HandoffRow, LineageRow } from "./db.ts";
 
 type ConceptView = ConceptRow & { origin_label: string; project_name: string };
@@ -44,6 +44,11 @@ function badge(text: string, className: string): string {
 /** Collapse internal whitespace so a CSS line-clamp truncates clean single-spaced text. */
 function flatPreview(body: string): string {
   return body.replace(/\s+/g, " ").trim();
+}
+
+/** Truncate a label to n chars (SVG has no line-clamp). Caller still esc()s the result. */
+function clip(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
 /**
@@ -187,7 +192,10 @@ function renderLineageSection(edges: LineageView[]): string {
         </div>`;
     })
     .join("");
-  return `<section><h2>Lineage <span class="count">${edges.length}</span></h2>${trees}</section>`;
+  const extras =
+    `<details class="view"><summary>Diagram</summary>${buildLineageSvg(parents)}</details>` +
+    `<details class="view"><summary>Table</summary>${renderLineageTable(edges)}</details>`;
+  return `<section><h2>Lineage <span class="count">${edges.length}</span></h2>${trees}${extras}</section>`;
 }
 
 function renderHandoffsSection(handoffs: HandoffView[]): string {
@@ -222,7 +230,166 @@ function renderHandoffsSection(handoffs: HandoffView[]): string {
       </article>`;
     })
     .join("");
-  return `<section><h2>Handoffs <span class="count">${handoffs.length}</span></h2><div class="timeline">${rows}</div></section>`;
+  return `<section><h2>Handoffs <span class="count">${handoffs.length}</span></h2><div class="timeline">${rows}</div>${renderHandoffExtras(handoffs)}</section>`;
+}
+
+// --- Phase 2: collapsed on-demand views — tables, inline-SVG diagrams, schema panel ----------
+
+function carriedCount(payload: string): number {
+  try {
+    const parsed = JSON.parse(payload);
+    return Array.isArray(parsed) ? parsed.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Dense handoff table + SVG timeline, both behind collapsed disclosures (no clog by default). */
+function renderHandoffExtras(handoffs: HandoffView[]): string {
+  const rows = handoffs
+    .map(
+      (h) => `<tr>
+        <td>${esc(h.from_label)} &rarr; ${esc(h.to_label)}</td>
+        <td>${badge(h.status, `ho-${h.status}`)}</td>
+        <td class="num">${carriedCount(h.payload_snapshot)}</td>
+        <td>${fmtTime(h.initiated_at)}</td>
+        <td>${fmtTime(h.returned_at)}</td>
+        <td class="clamp2">${esc(h.directive)}</td>
+      </tr>`,
+    )
+    .join("");
+  const table = `<table class="htbl"><thead><tr><th>route</th><th>status</th><th>carries</th><th>opened</th><th>returned</th><th>directive</th></tr></thead><tbody>${rows}</tbody></table>`;
+  const svg = buildHandoffTimelineSvg(handoffs);
+  return (
+    `<details class="view"><summary>Table</summary>${table}</details>` +
+    (svg ? `<details class="view"><summary>Timeline</summary>${svg}</details>` : "")
+  );
+}
+
+/** Each handoff as a horizontal lifeline on a shared time axis. Pure inline SVG, no library. */
+function buildHandoffTimelineSvg(handoffs: HandoffView[]): string {
+  const times: number[] = [];
+  for (const h of handoffs) {
+    const a = Date.parse(h.initiated_at);
+    if (Number.isFinite(a)) times.push(a);
+    if (h.returned_at) {
+      const b = Date.parse(h.returned_at);
+      if (Number.isFinite(b)) times.push(b);
+    }
+  }
+  if (times.length === 0) return "";
+  const min = Math.min(...times);
+  let max = Math.max(...times);
+  if (max === min) max = min + 1; // avoid divide-by-zero
+  const W = 720, ROW = 26, PADX = 150, PADR = 24, top = 14;
+  const H = top + handoffs.length * ROW + 12;
+  const x = (t: number) => PADX + ((t - min) / (max - min)) * (W - PADX - PADR);
+  const body = handoffs
+    .map((h, i) => {
+      const y = top + i * ROW + ROW / 2;
+      const a = Date.parse(h.initiated_at);
+      const bRaw = h.returned_at ? Date.parse(h.returned_at) : max;
+      const ax = Number.isFinite(a) ? x(a) : PADX;
+      const bx = Number.isFinite(bRaw) ? x(bRaw) : x(max);
+      const cls = `ho-${h.status}`;
+      const dash = h.status === "pending" ? ` stroke-dasharray="3 3"` : "";
+      const ret = h.returned_at ? `<circle cx="${bx.toFixed(1)}" cy="${y}" r="4" class="tl-ret"/>` : "";
+      return `<text x="8" y="${y + 4}" class="tl-label">${esc(clip(`${h.from_label} → ${h.to_label}`, 22))}</text>
+        <line x1="${ax.toFixed(1)}" y1="${y}" x2="${bx.toFixed(1)}" y2="${y}" class="tl-line ${cls}"${dash}/>
+        <circle cx="${ax.toFixed(1)}" cy="${y}" r="4" class="tl-open"/>${ret}`;
+    })
+    .join("");
+  return `<svg class="timeline-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="handoff timeline">${body}</svg>`;
+}
+
+/** Lineage as a relational companion to the text tree: child -> edge -> parent rows. */
+function renderLineageTable(edges: LineageView[]): string {
+  const rows = edges
+    .map(
+      (e) => `<tr>
+        <td>${esc(e.child_title)} <code class="id">${esc(e.from_concept_id)}</code></td>
+        <td>${badge(e.kind, "edge")}${e.reason ? badge(e.reason, "reason") : ""}</td>
+        <td>${esc(e.parent_title)} <code class="id">${esc(e.to_concept_id)}</code></td>
+        <td>${fmtTime(e.created_at)}</td>
+      </tr>`,
+    )
+    .join("");
+  return `<table class="ltbl"><thead><tr><th>child</th><th>edge</th><th>parent</th><th>when</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function lineageNode(x: number, y: number, w: number, label: string, isRoot: boolean): string {
+  return (
+    `<rect x="${x}" y="${y}" width="${w}" height="24" rx="6" class="ln-node${isRoot ? " ln-root" : ""}"/>` +
+    `<text x="${x + 8}" y="${y + 16}" class="ln-text">${esc(clip(label, 26))}</text>`
+  );
+}
+
+/** Hand-built SVG of the parent->branches forest: each root box links to its child boxes. No library. */
+function buildLineageSvg(parents: Map<string, { title: string; branches: LineageView[] }>): string {
+  const trees = [...parents.values()];
+  if (trees.length === 0) return "";
+  const W = 720, ROW = 34, NODEW = 200, GAP = 16, x0 = 12, x1 = x0 + NODEW + 60;
+  let y = 12;
+  const parts: string[] = [];
+  for (const t of trees) {
+    const k = Math.max(1, t.branches.length);
+    const rootY = y + ((k - 1) * ROW) / 2;
+    parts.push(lineageNode(x0, rootY, NODEW, t.title, true));
+    t.branches.forEach((b, j) => {
+      const cy = y + j * ROW;
+      parts.push(
+        `<path d="M ${x0 + NODEW} ${rootY + 12} C ${x0 + NODEW + 30} ${rootY + 12}, ${x1 - 30} ${cy + 12}, ${x1} ${cy + 12}" class="ln-edge"/>`,
+      );
+      parts.push(lineageNode(x1, cy, NODEW, b.child_title, false));
+    });
+    y += k * ROW + GAP;
+  }
+  return `<svg class="lineage-svg" viewBox="0 0 ${W} ${y + 8}" role="img" aria-label="lineage tree">${parts.join("")}</svg>`;
+}
+
+/** Compact type x status grid: at-a-glance shape of a project's concepts. Collapsed by default. */
+function renderMatrix(concepts: ConceptView[]): string {
+  if (concepts.length === 0) return "";
+  const counts = new Map<string, number>();
+  for (const c of concepts) {
+    const key = `${c.type}|${c.status}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const head = CONCEPT_STATUSES.map((s) => `<th>${badge(s, `st-${s}`)}</th>`).join("");
+  const rows = CONCEPT_TYPES.map((t) => {
+    const cells = CONCEPT_STATUSES.map((s) => {
+      const n = counts.get(`${t}|${s}`) ?? 0;
+      return n > 0 ? `<td class="num">${n}</td>` : `<td class="num zero">·</td>`;
+    }).join("");
+    return `<tr><th class="rt">${esc(t)}</th>${cells}</tr>`;
+  }).join("");
+  return `<details class="view matrix-wrap"><summary>Type × status</summary><table class="matrix"><thead><tr><th></th>${head}</tr></thead><tbody>${rows}</tbody></table></details>`;
+}
+
+// One-line purpose for each of the six tables — a self-documenting panel for the page.
+const SCHEMA_DOC: ReadonlyArray<readonly [string, string]> = [
+  ["project", "scope; one per repo / workstream"],
+  ["surface", "a participant — a Claude surface or the operator"],
+  ["concept", "the immutable unit of recorded state"],
+  ["lineage", "append-only edges, child → parent"],
+  ["handoff", "a surface-to-surface transition with a frozen payload"],
+  ["handoff_concept", "join: which concepts a handoff carries"],
+];
+
+function tableCounts(db: Database): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [t] of SCHEMA_DOC) {
+    out[t] = (db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${t}`).get()?.n ?? 0);
+  }
+  return out;
+}
+
+/** Collapsed self-documenting panel: the six tables, their purpose, and live row counts. */
+function renderSchemaPanel(counts: Record<string, number>): string {
+  const rows = SCHEMA_DOC.map(
+    ([t, purpose]) => `<tr><td><code>${t}</code></td><td>${esc(purpose)}</td><td class="num">${counts[t] ?? 0}</td></tr>`,
+  ).join("");
+  return `<details class="schema"><summary>Schema &amp; counts</summary><table class="schema-tbl"><thead><tr><th>table</th><th>purpose</th><th>rows</th></tr></thead><tbody>${rows}</tbody></table></details>`;
 }
 
 // --- project grouping -------------------------------------------------------
@@ -273,6 +440,7 @@ function renderProjectSection(p: ProjectBucket, opts: { live?: boolean }, open: 
     <details class="project" id="proj-${esc(p.id)}"${open ? " open" : ""}>
       <summary><span class="proj-name">${esc(p.name)}</span> <span class="count">${counts}</span>${focus}</summary>
       ${renderConceptsSection(p.concepts)}
+      ${renderMatrix(p.concepts)}
       ${renderLineageSection(p.edges)}
       ${renderHandoffsSection(p.handoffs)}
     </details>`;
@@ -388,7 +556,7 @@ const STYLE = `
   details.project > section:first-of-type { margin-top: 6px; }
 
   /* Long concept bodies: collapsed to a clamped preview; expanded body is height-capped so no single
-     concept can dominate the page. Native <details> + CSS line-clamp — no JS. */
+     concept can dominate the page. Native details/summary + CSS line-clamp — no JS. */
   details.card-body { margin: 8px 0 10px; }
   details.card-body > summary { color: #333a48; white-space: pre-wrap; cursor: pointer; list-style: none;
     display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
@@ -396,6 +564,42 @@ const STYLE = `
   details.card-body > summary::after { content: " \\2026 more"; color: var(--muted); font-size: 12px; }
   details.card-body[open] > summary { display: none; }
   details.card-body .body-full { color: #333a48; white-space: pre-wrap; max-height: 60vh; overflow: auto; }
+
+  /* Phase 2: collapsed on-demand views — tables, SVG diagrams, schema panel. */
+  details.view, details.schema { margin: 10px 0; }
+  details.view > summary, details.schema > summary { cursor: pointer; list-style: none;
+    color: var(--accent); font-size: 13px; font-weight: 600; padding: 5px 0; }
+  details.view > summary::-webkit-details-marker, details.schema > summary::-webkit-details-marker { display: none; }
+  details.view > summary::before, details.schema > summary::before { content: "\\25B8  "; color: var(--muted); }
+  details.view[open] > summary::before, details.schema[open] > summary::before { content: "\\25BE  "; }
+  details.schema { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 14px; margin: 0 0 18px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin: 8px 0 2px; }
+  thead th { position: sticky; top: 0; background: var(--panel); text-align: left;
+    font-size: 11.5px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted);
+    border-bottom: 1px solid var(--line); padding: 6px 8px; }
+  tbody td, tbody th { border-bottom: 1px solid var(--line); padding: 6px 8px; vertical-align: top; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.zero { color: var(--line); text-align: center; }
+  th.rt { text-align: left; font-weight: 600; color: var(--ink); }
+  td.clamp2 { max-width: 280px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  table code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+  .matrix th, .matrix td { text-align: center; }
+  .matrix th.rt { text-align: left; }
+
+  /* Hand-rolled SVG diagrams (no graph-viz library). */
+  .lineage-svg, .timeline-svg { width: 100%; height: auto; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; margin: 8px 0; }
+  .ln-node { fill: #ffffff; stroke: var(--line); }
+  .ln-root { fill: #eef5f4; stroke: var(--accent); }
+  .ln-text { font-size: 12px; fill: var(--ink); }
+  .ln-edge { fill: none; stroke: var(--line); stroke-width: 1.5; }
+  .tl-line { stroke: var(--muted); stroke-width: 2; }
+  .tl-line.ho-pending { stroke: #9a6b16; }
+  .tl-line.ho-returned { stroke: #1f7a47; }
+  .tl-line.ho-consumed { stroke: #2c4fa6; }
+  .tl-open { fill: var(--accent); }
+  .tl-ret { fill: #ffffff; stroke: var(--accent); stroke-width: 1.5; }
+  .tl-label { font-size: 11px; fill: var(--ink); }
 `;
 
 /**
@@ -417,6 +621,7 @@ export function renderHtml(db: Database, opts: { live?: boolean; only?: string }
   const shown = opts.only ? projects.filter((p) => p.id === opts.only) : projects;
   const projectIndex = renderProjectIndex(projects, opts);
   const overview = renderOverview(concepts, projects.length, lineage.length, handoffs.length);
+  const schemaPanel = renderSchemaPanel(tableCounts(db));
   // Small pools stay open and scannable; large ones collapse to an index of project headers. A
   // project scoped via ?project= is always open.
   const isOpen = (p: ProjectBucket) => projects.length <= 3 || opts.only === p.id;
@@ -449,6 +654,7 @@ export function renderHtml(db: Database, opts: { live?: boolean; only?: string }
       ${overview}
       ${projectIndex}
     </div>
+    ${schemaPanel}
     ${sections}
   </div>
 </body>
