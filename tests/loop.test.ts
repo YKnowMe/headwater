@@ -343,3 +343,26 @@ test("render adds a type x status matrix per project", () => {
   expect(html).toContain('<table class="matrix">');
   rdb.close();
 });
+
+test("lineage representations form an exclusive switch (one open at a time, tree by default)", () => {
+  const rdb = initDb(":memory:");
+  const parent = writeConcept(rdb, { project: "p", type: "decision", title: "Parent", body: "p", surface: "s" });
+  forkConcept(rdb, { parent_id: parent.id, body: "c", surface: "s", title: "Child" });
+  const html = renderHtml(rdb);
+  // three views share one <details name> group -> native exclusive switch; the tree is open by default
+  const grouped = html.match(/<details class="view" name="lin-[^"]+"/g) ?? [];
+  expect(grouped.length).toBe(3);
+  expect(html).toMatch(/<details class="view" name="lin-[^"]+" open><summary>Tree<\/summary>/);
+  rdb.close();
+});
+
+test("handoff representations form an exclusive switch (cards by default)", () => {
+  const rdb = initDb(":memory:");
+  const a = writeConcept(rdb, { project: "p", type: "note", title: "A", body: "a", surface: "s1" });
+  openHandoff(rdb, { project: "p", from_surface: "s1", to_surface: "s2", concept_ids: [a.id], directive: "do x" });
+  const html = renderHtml(rdb);
+  const grouped = html.match(/<details class="view" name="ho-[^"]+"/g) ?? [];
+  expect(grouped.length).toBe(3); // cards | table | timeline
+  expect(html).toMatch(/<details class="view" name="ho-[^"]+" open><summary>Cards<\/summary>/);
+  rdb.close();
+});

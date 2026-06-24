@@ -161,7 +161,7 @@ function renderOverview(concepts: ConceptView[], projectCount: number, lineageCo
     </div>`;
 }
 
-function renderLineageSection(edges: LineageView[]): string {
+function renderLineageSection(edges: LineageView[], key: string): string {
   if (edges.length === 0) {
     return `<section><h2>Lineage</h2><p class="empty">No lineage edges yet.</p></section>`;
   }
@@ -192,27 +192,18 @@ function renderLineageSection(edges: LineageView[]): string {
         </div>`;
     })
     .join("");
-  const extras =
-    `<details class="view"><summary>Diagram</summary>${buildLineageSvg(parents)}</details>` +
-    `<details class="view"><summary>Table</summary>${renderLineageTable(edges)}</details>`;
-  return `<section><h2>Lineage <span class="count">${edges.length}</span></h2>${trees}${extras}</section>`;
+  // Exclusive switch: tree (as-is) | diagram | table — same lineage, one representation at a time.
+  const g = `lin-${esc(key)}`;
+  const views =
+    `<details class="view" name="${g}" open><summary>Tree</summary>${trees}</details>` +
+    `<details class="view" name="${g}"><summary>Diagram</summary>${buildLineageSvg(parents)}</details>` +
+    `<details class="view" name="${g}"><summary>Table</summary>${renderLineageTable(edges)}</details>`;
+  return `<section><h2>Lineage <span class="count">${edges.length}</span></h2><div class="switch">${views}</div></section>`;
 }
 
-function renderHandoffsSection(handoffs: HandoffView[]): string {
-  if (handoffs.length === 0) {
-    return `<section><h2>Handoffs</h2><p class="empty">No handoffs yet.</p></section>`;
-  }
-  const rows = handoffs
-    .map((h) => {
-      const carried = ((): number => {
-        try {
-          const parsed = JSON.parse(h.payload_snapshot);
-          return Array.isArray(parsed) ? parsed.length : 0;
-        } catch {
-          return 0;
-        }
-      })();
-      return `
+function renderHandoffCard(h: HandoffView): string {
+  const carried = carriedCount(h.payload_snapshot);
+  return `
       <article class="handoff">
         <div class="handoff-head">
           <span class="route">${esc(h.from_label)} <span class="arrow">&rarr;</span> ${esc(h.to_label)}</span>
@@ -228,9 +219,24 @@ function renderHandoffsSection(handoffs: HandoffView[]): string {
         </div>
         ${h.return_note ? `<p class="return-note"><strong>Return note:</strong> ${esc(h.return_note)}</p>` : ""}
       </article>`;
-    })
-    .join("");
-  return `<section><h2>Handoffs <span class="count">${handoffs.length}</span></h2><div class="timeline">${rows}</div>${renderHandoffExtras(handoffs)}</section>`;
+}
+
+/**
+ * Handoffs as an exclusive switch (cards | table | timeline) — the same data, one representation at a
+ * time. Native <details name=...> makes the group mutually exclusive, no client JS. Cards open by default.
+ */
+function renderHandoffsSection(handoffs: HandoffView[], key: string): string {
+  if (handoffs.length === 0) {
+    return `<section><h2>Handoffs</h2><p class="empty">No handoffs yet.</p></section>`;
+  }
+  const g = `ho-${esc(key)}`;
+  const cards = `<div class="timeline">${handoffs.map(renderHandoffCard).join("")}</div>`;
+  const svg = buildHandoffTimelineSvg(handoffs);
+  const views =
+    `<details class="view" name="${g}" open><summary>Cards</summary>${cards}</details>` +
+    `<details class="view" name="${g}"><summary>Table</summary>${renderHandoffTable(handoffs)}</details>` +
+    (svg ? `<details class="view" name="${g}"><summary>Timeline</summary>${svg}</details>` : "");
+  return `<section><h2>Handoffs <span class="count">${handoffs.length}</span></h2><div class="switch">${views}</div></section>`;
 }
 
 // --- Phase 2: collapsed on-demand views — tables, inline-SVG diagrams, schema panel ----------
@@ -244,8 +250,8 @@ function carriedCount(payload: string): number {
   }
 }
 
-/** Dense handoff table + SVG timeline, both behind collapsed disclosures (no clog by default). */
-function renderHandoffExtras(handoffs: HandoffView[]): string {
+/** Dense handoff table (one representation of the switch). */
+function renderHandoffTable(handoffs: HandoffView[]): string {
   const rows = handoffs
     .map(
       (h) => `<tr>
@@ -258,12 +264,7 @@ function renderHandoffExtras(handoffs: HandoffView[]): string {
       </tr>`,
     )
     .join("");
-  const table = `<table class="htbl"><thead><tr><th>route</th><th>status</th><th>carries</th><th>opened</th><th>returned</th><th>directive</th></tr></thead><tbody>${rows}</tbody></table>`;
-  const svg = buildHandoffTimelineSvg(handoffs);
-  return (
-    `<details class="view"><summary>Table</summary>${table}</details>` +
-    (svg ? `<details class="view"><summary>Timeline</summary>${svg}</details>` : "")
-  );
+  return `<table class="htbl"><thead><tr><th>route</th><th>status</th><th>carries</th><th>opened</th><th>returned</th><th>directive</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 /** Each handoff as a horizontal lifeline on a shared time axis. Pure inline SVG, no library. */
@@ -441,8 +442,8 @@ function renderProjectSection(p: ProjectBucket, opts: { live?: boolean }, open: 
       <summary><span class="proj-name">${esc(p.name)}</span> <span class="count">${counts}</span>${focus}</summary>
       ${renderConceptsSection(p.concepts)}
       ${renderMatrix(p.concepts)}
-      ${renderLineageSection(p.edges)}
-      ${renderHandoffsSection(p.handoffs)}
+      ${renderLineageSection(p.edges, p.id)}
+      ${renderHandoffsSection(p.handoffs, p.id)}
     </details>`;
 }
 
@@ -573,6 +574,14 @@ const STYLE = `
   details.view > summary::before, details.schema > summary::before { content: "\\25B8  "; color: var(--muted); }
   details.view[open] > summary::before, details.schema[open] > summary::before { content: "\\25BE  "; }
   details.schema { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 14px; margin: 0 0 18px; }
+
+  /* Representation switch: tree|diagram|table (lineage) and cards|table|timeline (handoffs) are an
+     exclusive group via the native details[name] grouping; the summaries read as selectable pills. No JS. */
+  .switch { margin: 8px 0 0; }
+  .switch > details.view > summary { display: inline-block; padding: 3px 12px; margin: 0 0 8px;
+    border: 1px solid var(--line); border-radius: 999px; color: var(--accent); font-weight: 600; }
+  .switch > details.view > summary::before { content: ""; margin: 0; }
+  .switch > details.view[open] > summary { background: var(--accent); color: #fff; border-color: var(--accent); }
   table { border-collapse: collapse; width: 100%; font-size: 13px; margin: 8px 0 2px; }
   thead th { position: sticky; top: 0; background: var(--panel); text-align: left;
     font-size: 11.5px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted);
