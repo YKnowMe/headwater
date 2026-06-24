@@ -27,7 +27,10 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
   the page from the pool on every request; in that live mode the page carries one vanilla-JS Refresh button
   (`location.reload()`) — no framework. Read-only either way (only SELECTs; never mutates pool data).
   In the live viewer, concept bodies render the escape-first markdown subset + `` ```mermaid `` blocks
-  per the Locked-stack carve-out (the static file shows `` ```mermaid `` source as a code block).
+  per the Locked-stack carve-out (the static file shows `` ```mermaid `` source as a code block). The live
+  viewer also honors **read-only** query-param filters (`?project=`/`?type=`/`?status=`/`?surface=`/`?q=`;
+  `q` is a plain SQL `LIKE` substring — not FTS) via a live-only filter bar + GET search form; the static
+  file is the unfiltered snapshot.
 - `src/index.ts` — entry point; calls `startServer()`.
 - `tests/loop.test.ts` — `bun:test` end-to-end smoke test of the full loop against a temp DB.
 - `vendor/mermaid.min.js` — the self-contained Mermaid UMD bundle (a vendored static asset, **not** an

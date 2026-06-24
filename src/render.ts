@@ -133,16 +133,30 @@ function renderBody(body: string, live: boolean): string {
 
 // --- data access ------------------------------------------------------------
 
-function loadConcepts(db: Database): ConceptView[] {
+// Live-only concept filters (the static render passes none). q is a plain SQL LIKE substring — NOT
+// FTS, no ranking, no highlight — so it stays inside the scope fence. type/status are validated against
+// the enums in handleViewerRequest before reaching here; all binds are parameterized.
+type Filters = { type?: string; status?: string; surface?: string; q?: string };
+
+function loadConcepts(db: Database, f: Filters = {}): ConceptView[] {
   return db
-    .query<ConceptView, []>(
+    .query<ConceptView, any>(
       `SELECT c.*, s.label AS origin_label, p.name AS project_name
          FROM concept c
          JOIN surface s ON s.id = c.origin_surface_id
          JOIN project p ON p.id = c.project_id
+        WHERE ($type IS NULL OR c.type = $type)
+          AND ($status IS NULL OR c.status = $status)
+          AND ($surface IS NULL OR c.origin_surface_id = $surface OR s.label = $surface)
+          AND ($qlike IS NULL OR c.title LIKE $qlike OR c.body LIKE $qlike)
         ORDER BY c.created_at ASC`,
     )
-    .all();
+    .all({
+      $type: f.type ?? null,
+      $status: f.status ?? null,
+      $surface: f.surface ?? null,
+      $qlike: f.q ? `%${f.q}%` : null,
+    });
 }
 
 function loadLineage(db: Database): LineageView[] {
@@ -530,6 +544,64 @@ function renderProjectIndex(projects: ProjectBucket[], opts: { live?: boolean; o
   return `<nav class="proj-index">${chips}${allLink}</nav>`;
 }
 
+// --- Phase 3: live-only faceted filters + plain-LIKE search (server-side, no client JS) ------------
+
+type ViewOpts = { live?: boolean; only?: string; filters?: Filters };
+
+function distinctSurfaces(db: Database): string[] {
+  return db
+    .query<{ label: string }, []>(
+      `SELECT DISTINCT s.label AS label FROM concept c JOIN surface s ON s.id = c.origin_surface_id ORDER BY label`,
+    )
+    .all()
+    .map((r) => r.label);
+}
+
+/** Build a "/" URL preserving the current project + filters, applying one set/clear change. */
+function filterHref(opts: ViewOpts, change: Record<string, string | null>): string {
+  const f = opts.filters ?? {};
+  const p = new URLSearchParams();
+  if (opts.only) p.set("project", opts.only);
+  if (f.type) p.set("type", f.type);
+  if (f.status) p.set("status", f.status);
+  if (f.surface) p.set("surface", f.surface);
+  if (f.q) p.set("q", f.q);
+  for (const [k, v] of Object.entries(change)) {
+    if (v == null) p.delete(k);
+    else p.set(k, v);
+  }
+  const s = p.toString();
+  return s ? `/?${s}` : "/";
+}
+
+/** Faceted chips (type/status/surface) + a GET search box — all live-only, all read-only navigation. */
+function renderFilterBar(db: Database, opts: ViewOpts): string {
+  const f = opts.filters ?? {};
+  const chip = (label: string, dim: "type" | "status" | "surface", val: string): string => {
+    const active = f[dim] === val;
+    const href = esc(filterHref(opts, { [dim]: active ? null : val }));
+    return `<a class="fchip${active ? " active" : ""}" href="${href}">${esc(label)}</a>`;
+  };
+  const types = CONCEPT_TYPES.map((t) => chip(t, "type", t)).join("");
+  const statuses = CONCEPT_STATUSES.map((s) => chip(s, "status", s)).join("");
+  const surfaces = distinctSurfaces(db).map((s) => chip(s, "surface", s)).join("");
+  const anyActive = f.type || f.status || f.surface || f.q;
+  const clear = anyActive ? `<a class="fchip clear" href="${esc(filterHref(opts, { type: null, status: null, surface: null, q: null }))}">clear</a>` : "";
+  const hidden = (["project", "type", "status", "surface"] as const)
+    .map((k) => {
+      const v = k === "project" ? opts.only : f[k as "type" | "status" | "surface"];
+      return v ? `<input type="hidden" name="${k}" value="${esc(v)}" />` : "";
+    })
+    .join("");
+  const search = `<form class="search" method="get" action="/"><input type="text" name="q" value="${esc(f.q ?? "")}" placeholder="search title / body" />${hidden}</form>`;
+  return `<nav class="filter-bar">
+      <span class="flabel">type</span>${types}
+      <span class="flabel">status</span>${statuses}
+      ${surfaces ? `<span class="flabel">surface</span>${surfaces}` : ""}
+      ${search}${clear}
+    </nav>`;
+}
+
 const STYLE = `
   :root {
     --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #6b7385;
@@ -614,6 +686,19 @@ const STYLE = `
     background: var(--panel); color: var(--accent); text-decoration: none; }
   .proj-chip:hover { border-color: var(--accent); }
   .proj-chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  /* Live-only filter bar: faceted chips + a GET search box (read-only navigation, no client JS). */
+  .filter-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 10px 0 0; }
+  .flabel { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-left: 8px; }
+  .flabel:first-child { margin-left: 0; }
+  .fchip { font-size: 12px; padding: 2px 9px; border: 1px solid var(--line); border-radius: 999px;
+    background: var(--panel); color: var(--ink); text-decoration: none; }
+  .fchip:hover { border-color: var(--accent); }
+  .fchip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .fchip.clear { color: var(--muted); }
+  .filter-bar .search { display: inline-flex; margin-left: auto; }
+  .filter-bar .search input { font: inherit; font-size: 12.5px; padding: 3px 11px;
+    border: 1px solid var(--line); border-radius: 999px; min-width: 170px; }
   details.project { border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
     padding: 4px 20px 12px; margin: 22px 0; }
   details.project > summary { font-size: 18px; font-weight: 700; cursor: pointer; list-style: none;
@@ -699,8 +784,8 @@ const STYLE = `
  * `bun run serve` viewer), the header gets a vanilla-JS Refresh button that reloads the page,
  * which re-renders it. The static `bun run render` output omits the button (pure HTML/CSS).
  */
-export function renderHtml(db: Database, opts: { live?: boolean; only?: string } = {}): string {
-  const concepts = loadConcepts(db);
+export function renderHtml(db: Database, opts: ViewOpts = {}): string {
+  const concepts = loadConcepts(db, opts.filters ?? {});
   const lineage = loadLineage(db);
   const handoffs = loadHandoffs(db);
   const refreshButton = opts.live
@@ -717,6 +802,7 @@ export function renderHtml(db: Database, opts: { live?: boolean; only?: string }
   const projects = groupByProject(concepts, lineage, handoffs);
   const shown = opts.only ? projects.filter((p) => p.id === opts.only) : projects;
   const projectIndex = renderProjectIndex(projects, opts);
+  const filterBar = opts.live ? renderFilterBar(db, opts) : "";
   const overview = renderOverview(concepts, projects.length, lineage.length, handoffs.length);
   const schemaPanel = renderSchemaPanel(tableCounts(db));
   // Small pools stay open and scannable; large ones collapse to an index of project headers. A
@@ -750,6 +836,7 @@ export function renderHtml(db: Database, opts: { live?: boolean; only?: string }
     <div class="toolbar">
       ${overview}
       ${projectIndex}
+      ${filterBar}
     </div>
     ${schemaPanel}
     ${sections}
@@ -771,9 +858,19 @@ function handleViewerRequest(req: Request, db: Database): Response {
     });
   }
   if (url.pathname === "/" || url.pathname === "/index.html") {
-    // ?project=<id> scopes the page to one project (server-side; no client JS). Absent -> all projects.
-    const only = url.searchParams.get("project") ?? undefined;
-    return new Response(renderHtml(db, { live: true, only }), {
+    // Read-only query state (server-side; no client JS). ?project= scopes to one project; type/status
+    // are validated against the enums; surface is matched by id-or-label; q is a plain LIKE substring.
+    const sp = url.searchParams;
+    const only = sp.get("project") ?? undefined;
+    const type = sp.get("type");
+    const status = sp.get("status");
+    const filters: Filters = {
+      type: type && (CONCEPT_TYPES as readonly string[]).includes(type) ? type : undefined,
+      status: status && (CONCEPT_STATUSES as readonly string[]).includes(status) ? status : undefined,
+      surface: sp.get("surface") ?? undefined,
+      q: sp.get("q")?.trim() || undefined,
+    };
+    return new Response(renderHtml(db, { live: true, only, filters }), {
       headers: { "content-type": "text/html; charset=utf-8" },
     });
   }

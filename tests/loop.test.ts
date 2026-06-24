@@ -284,6 +284,40 @@ test("rich body blocks js-scheme and attribute-breakout injection vectors", () =
   rdb.close();
 });
 
+// --- render.ts Phase 3: live-only filters + plain-LIKE search ---
+
+test("live filter ?type= scopes concepts via parameterized SQL", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "p", type: "decision", title: "DECISION_ONE", body: "d", surface: "s" });
+  writeConcept(rdb, { project: "p", type: "note", title: "NOTE_ONE", body: "n", surface: "s" });
+  const html = renderHtml(rdb, { live: true, filters: { type: "decision" } });
+  expect(html).toContain("DECISION_ONE");
+  expect(html).not.toContain("NOTE_ONE");
+  rdb.close();
+});
+
+test("live filter ?q= matches a title/body substring (LIKE, case-insensitive)", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "p", type: "note", title: "alpha", body: "find the WIDGET here", surface: "s" });
+  writeConcept(rdb, { project: "p", type: "note", title: "beta", body: "nothing", surface: "s" });
+  const html = renderHtml(rdb, { live: true, filters: { q: "widget" } });
+  expect(html).toContain("alpha");
+  expect(html).not.toContain("beta");
+  rdb.close();
+});
+
+test("filter bar + GET search render only in the live viewer (static stays form-free)", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "p", type: "decision", title: "A", body: "a", surface: "s" });
+  const live = renderHtml(rdb, { live: true });
+  const stat = renderHtml(rdb);
+  expect(live).toContain('class="filter-bar"');
+  expect(live).toContain('name="q"');
+  expect(stat).not.toContain('class="filter-bar"');
+  expect(stat).not.toContain("<form");
+  rdb.close();
+});
+
 test("mermaid blocks render live as <pre class=\"mermaid\"> with the script; static as a code block", () => {
   const rdb = initDb(":memory:");
   writeConcept(rdb, { project: "p", type: "note", title: "m", body: "```mermaid\ngraph TD; A-->B;\n```", surface: "s" });
