@@ -115,6 +115,18 @@ function renderConceptCard(c: ConceptView): string {
     </article>`;
 }
 
+// Cap how many cards a single status group renders inline; the rest tuck behind a CSS-only "show
+// more" disclosure so a 200-concept group can't blow out the page (every card stays one click away).
+const CARD_CAP = 12;
+
+function renderCards(items: ConceptView[]): string {
+  const cards = items.map(renderConceptCard);
+  if (cards.length <= CARD_CAP) return `<div class="cards">${cards.join("")}</div>`;
+  const head = cards.slice(0, CARD_CAP).join("");
+  const rest = cards.slice(CARD_CAP).join("");
+  return `<div class="cards">${head}</div><details class="more"><summary>Show ${cards.length - CARD_CAP} more</summary><div class="cards">${rest}</div></details>`;
+}
+
 function renderConceptsSection(concepts: ConceptView[]): string {
   if (concepts.length === 0) {
     return `<section><h2>Concepts</h2><p class="empty">No concepts yet.</p></section>`;
@@ -125,10 +137,23 @@ function renderConceptsSection(concepts: ConceptView[]): string {
     return `
       <div class="status-group">
         <h3 class="status-head">${badge(status, `st-${status}`)} <span class="count">${items.length}</span></h3>
-        <div class="cards">${items.map(renderConceptCard).join("")}</div>
+        ${renderCards(items)}
       </div>`;
   }).join("");
   return `<section><h2>Concepts <span class="count">${concepts.length}</span></h2>${groups}</section>`;
+}
+
+/** Sticky toolbar content: pool scale + per-status tallies, so the reader gets shape at a glance. */
+function renderOverview(concepts: ConceptView[], projectCount: number, lineageCount: number, handoffCount: number): string {
+  const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
+  const tallies = CONCEPT_STATUSES.map((s) => [s, concepts.filter((c) => c.status === s).length] as const)
+    .filter(([, n]) => n > 0)
+    .map(([s, n]) => `${badge(s, `st-${s}`)} <span class="count">${n}</span>`)
+    .join(" ");
+  return `<div class="overview">
+      <span class="scale">${plural(projectCount, "project")} · ${plural(concepts.length, "concept")} · ${plural(lineageCount, "lineage edge")} · ${plural(handoffCount, "handoff")}</span>
+      <span class="tallies">${tallies}</span>
+    </div>`;
 }
 
 function renderLineageSection(edges: LineageView[]): string {
@@ -239,12 +264,13 @@ function groupByProject(concepts: ConceptView[], lineage: LineageView[], handoff
   return [...buckets.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
-/** One project's whole slice: a collapsible section wrapping its concepts, lineage, and handoffs. */
-function renderProjectSection(p: ProjectBucket, opts: { live?: boolean }): string {
+/** One project's whole slice: a collapsible section wrapping its concepts, lineage, and handoffs.
+ *  `open` is decided by the caller — small pools stay expanded, large ones collapse to a scannable index. */
+function renderProjectSection(p: ProjectBucket, opts: { live?: boolean }, open: boolean): string {
   const counts = `${p.concepts.length}c · ${p.edges.length}l · ${p.handoffs.length}h`;
   const focus = opts.live ? ` <a class="focus" href="/?project=${encodeURIComponent(p.id)}">focus</a>` : "";
   return `
-    <details class="project" id="proj-${esc(p.id)}" open>
+    <details class="project" id="proj-${esc(p.id)}"${open ? " open" : ""}>
       <summary><span class="proj-name">${esc(p.name)}</span> <span class="count">${counts}</span>${focus}</summary>
       ${renderConceptsSection(p.concepts)}
       ${renderLineageSection(p.edges)}
@@ -328,8 +354,24 @@ const STYLE = `
   .return-note { margin: 10px 0 0; padding: 8px 12px; background: #f3f6f5; border-radius: 8px; font-size: 14px; }
   .empty { color: var(--muted); font-style: italic; }
 
+  /* Sticky toolbar: pool-scale overview + the project switcher ride along as you scroll. */
+  .toolbar { position: sticky; top: 0; z-index: 5; background: var(--bg);
+    padding: 10px 0 8px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
+  .overview { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; }
+  .overview .scale { font-size: 13px; font-weight: 600; color: var(--ink); }
+  .overview .tallies { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+
+  /* "Show more" disclosure for an over-long status group — every card stays one click away. */
+  .more { margin-top: 12px; }
+  .more > summary { cursor: pointer; list-style: none; color: var(--accent);
+    font-size: 13px; font-weight: 600; padding: 6px 0; }
+  .more > summary::-webkit-details-marker { display: none; }
+  .more > summary::before { content: "\\25B8  "; color: var(--muted); }
+  .more[open] > summary::before { content: "\\25BE  "; }
+  .more .cards { margin-top: 12px; }
+
   /* Per-project sections: the shared pool's projects are visually contained, not commingled. */
-  .proj-index { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 26px; }
+  .proj-index { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 0; }
   .proj-chip { font-size: 13px; padding: 4px 11px; border: 1px solid var(--line); border-radius: 999px;
     background: var(--panel); color: var(--accent); text-decoration: none; }
   .proj-chip:hover { border-color: var(--accent); }
@@ -374,9 +416,13 @@ export function renderHtml(db: Database, opts: { live?: boolean; only?: string }
   const projects = groupByProject(concepts, lineage, handoffs);
   const shown = opts.only ? projects.filter((p) => p.id === opts.only) : projects;
   const projectIndex = renderProjectIndex(projects, opts);
+  const overview = renderOverview(concepts, projects.length, lineage.length, handoffs.length);
+  // Small pools stay open and scannable; large ones collapse to an index of project headers. A
+  // project scoped via ?project= is always open.
+  const isOpen = (p: ProjectBucket) => projects.length <= 3 || opts.only === p.id;
   const sections =
     shown.length > 0
-      ? shown.map((p) => renderProjectSection(p, opts)).join("")
+      ? shown.map((p) => renderProjectSection(p, opts, isOpen(p))).join("")
       : `<p class="empty">Nothing in the pool yet.</p>`;
 
   return `<!doctype html>
@@ -398,8 +444,11 @@ export function renderHtml(db: Database, opts: { live?: boolean; only?: string }
         ${refreshButton}
       </div>
     </header>
-    <p class="generated">Generated ${fmtTime(nowIso())} · ${concepts.length} concepts · ${lineage.length} lineage edges · ${handoffs.length} handoffs</p>
-    ${projectIndex}
+    <p class="generated">Generated ${fmtTime(nowIso())}</p>
+    <div class="toolbar">
+      ${overview}
+      ${projectIndex}
+    </div>
     ${sections}
   </div>
 </body>

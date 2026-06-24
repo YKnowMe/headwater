@@ -258,3 +258,49 @@ test("initDb stamps a schema version and re-initialising an existing pool runs n
   a.close();
   rmSync(dir, { recursive: true, force: true });
 });
+
+// --- render.ts Phase 1: readability/density on a clogged page ---
+
+test("render shows an overview header with pool scale and per-status tallies", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "p", type: "decision", title: "A", body: "a", surface: "s", status: "active" });
+  writeConcept(rdb, { project: "p", type: "note", title: "B", body: "b", surface: "s", status: "locked" });
+  const html = renderHtml(rdb);
+  expect(html).toContain('class="overview"');
+  expect(html).toContain("2 concepts");
+  const overview = html.slice(html.indexOf('class="overview"'), html.indexOf('class="overview"') + 500);
+  expect(overview).toContain("st-active");
+  expect(overview).toContain("st-locked");
+  rdb.close();
+});
+
+test("render collapses projects by default once there are more than 3", () => {
+  const rdb = initDb(":memory:");
+  for (const name of ["a", "b", "c", "d"]) {
+    writeConcept(rdb, { project: name, type: "note", title: `t-${name}`, body: "x", surface: "s" });
+  }
+  const html = renderHtml(rdb);
+  expect(html).not.toMatch(/<details class="project"[^>]*\sopen>/);
+  rdb.close();
+});
+
+test("render keeps projects expanded when there are 3 or fewer", () => {
+  const rdb = initDb(":memory:");
+  for (const name of ["a", "b"]) {
+    writeConcept(rdb, { project: name, type: "note", title: `t-${name}`, body: "x", surface: "s" });
+  }
+  const html = renderHtml(rdb);
+  expect(html).toMatch(/<details class="project"[^>]*\sopen>/);
+  rdb.close();
+});
+
+test("render caps a long status group and tucks the rest behind 'show more'", () => {
+  const rdb = initDb(":memory:");
+  for (let i = 0; i < 15; i++) {
+    writeConcept(rdb, { project: "p", type: "note", title: `c${i}`, body: "b", surface: "s" });
+  }
+  const html = renderHtml(rdb);
+  expect(html).toContain('<details class="more">');
+  expect(html).toContain("Show 3 more"); // 15 - 12 cap
+  rdb.close();
+});
