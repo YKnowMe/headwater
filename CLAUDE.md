@@ -9,6 +9,14 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
 - **Only two runtime deps:** `@modelcontextprotocol/sdk` (MCP server) and `zod` (tool input schemas).
 - Use Bun built-ins for everything else: `bun:sqlite` (the pool), `bun:test` (tests), `Bun.write` +
   template literals (static HTML). No web framework, no ORM, no extra libraries.
+- **Carve-out (deliberate, operator-approved — see the superseding concept in the pool):** the live
+  `bun run serve` viewer renders rich concept bodies — a fixed escape-first markdown subset (images via
+  `http(s)` URLs, pipe-tables, bold/italic/`code`/links) parsed server-side, and `` ```mermaid `` diagram
+  blocks rendered **client-side** by a **vendored** Mermaid bundle (`vendor/mermaid.min.js`,
+  `securityLevel: 'strict'`, **live-viewer only**). This is the single allowed exception to "no client JS /
+  no graph-viz library". The two Bun runtime deps are unchanged — Mermaid is a vendored static asset served
+  to the browser, not a server/runtime import. The static `bun run render` file stays pure HTML/CSS and
+  shows `` ```mermaid `` as a code block.
 
 ## Layout (closed file list — do not add source files)
 - `src/db.ts` — schema, idempotent init/connection (`bun:sqlite`), data-dir resolution, id/slug/time helpers.
@@ -18,8 +26,13 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
   Also `bun run serve`: a tiny `Bun.serve` viewer (a runtime built-in, not a web framework) that re-renders
   the page from the pool on every request; in that live mode the page carries one vanilla-JS Refresh button
   (`location.reload()`) — no framework. Read-only either way (only SELECTs; never mutates pool data).
+  In the live viewer, concept bodies render the escape-first markdown subset + `` ```mermaid `` blocks
+  per the Locked-stack carve-out (the static file shows `` ```mermaid `` source as a code block).
 - `src/index.ts` — entry point; calls `startServer()`.
 - `tests/loop.test.ts` — `bun:test` end-to-end smoke test of the full loop against a temp DB.
+- `vendor/mermaid.min.js` — the self-contained Mermaid UMD bundle (a vendored static asset, **not** an
+  npm dep), served by the live viewer to render diagram blocks offline. The only vendored asset; do not
+  add others without a recorded decision.
 
 ## Data — one authoritative SQLite pool
 - Lives **outside the repo**: `~/.workspace/pool.db` by default, override with `HANDOFF_DATA_DIR`.
@@ -52,8 +65,9 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
 
 ## Scope fence — do NOT build (ask first if you think something is genuinely missing)
 No FTS, no vector/semantic recall, no reranking. No auth, multi-user, teams, cloud, or sync. No automatic
-cross-reference discovery, no graph-viz library, no design-tool surface, no orchestration. No speculative
-abstractions or plugin layers.
+cross-reference discovery, no design-tool surface, no orchestration. No speculative abstractions or plugin
+layers. No graph-viz library — **except** the one recorded carve-out above (a vendored, live-viewer-only,
+`strict` Mermaid for diagrams embedded in concept bodies).
 
 ## Run
 - `bun run start` — MCP server (stdio). `bun run render` — write `index.html`. `bun run serve` — live viewer
