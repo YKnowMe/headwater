@@ -5,10 +5,30 @@
   "module": "src/index.ts",
   "type": "module",
   "license": "MIT",
+  "author": "YKnowMe",
+  "homepage": "https://github.com/YKnowMe/headwater#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YKnowMe/headwater.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YKnowMe/headwater/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "local-first",
+    "sqlite",
+    "bun",
+    "handoff",
+    "agent-memory"
+  ],
   "scripts": {
     "start": "bun run src/index.ts",
     "render": "bun run src/render.ts",
-    "serve": "bun run src/render.ts serve"
+    "serve": "bun run src/render.ts serve",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "latest"

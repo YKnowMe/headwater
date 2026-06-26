@@ -1056,6 +1056,8 @@ export function startViewer(
   port: number = Number(process.env.HEADWATER_VIEW_PORT ?? DEFAULT_VIEW_PORT),
 ) {
   const db = initDb();
+  // The pool handle stays open for the viewer's lifetime — the viewer runs until the process exits, when
+  // the OS reclaims it (tests that start/stop repeatedly do best-effort cleanup; see loop.test.ts).
   // Bind to loopback only: the viewer has write actions and no auth, so it must never be reachable off
   // this machine. 127.0.0.1 keeps it on the local interface (the deliberate v1 unauthenticated-localhost
   // posture — see CLAUDE.md). The fetch handler is async (it may apply a write before responding).
