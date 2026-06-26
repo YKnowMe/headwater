@@ -17,6 +17,7 @@ import {
   openHandoff,
   returnHandoff,
   readProjectState,
+  SERVER_INSTRUCTIONS,
 } from "../src/server.ts";
 import { renderHtml, handleViewerRequest, startViewer } from "../src/render.ts";
 
@@ -640,4 +641,12 @@ test("the live viewer binds to loopback (127.0.0.1), not all interfaces", () => 
       /* best-effort cleanup */
     }
   }
+});
+
+test("the server ships permanent usage instructions every client gets on connect", () => {
+  // Broadcast via the MCP `instructions` field — no per-session/per-project setup on any surface.
+  expect(SERVER_INSTRUCTIONS.length).toBeGreaterThan(0);
+  expect(SERVER_INSTRUCTIONS).toContain("read_project_state"); // the kickoff ritual
+  expect(SERVER_INSTRUCTIONS).toContain("fork_concept"); // the immutability/forking rule
+  expect(SERVER_INSTRUCTIONS).toContain("How to use headwater effectively"); // pointer to the in-pool guide
 });

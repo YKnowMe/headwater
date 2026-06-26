@@ -432,9 +432,27 @@ export function registerTools(server: McpServer, db: Database): void {
 }
 
 /** Open the default pool, build the MCP server, and serve over stdio. */
+/**
+ * Usage guidance returned to EVERY client on `initialize` (the MCP `instructions` field), so any
+ * surface — Claude Code, Desktop, Design, other agents — learns how to use headwater without per-session
+ * or per-project setup. Kept concise (it rides every connection); the full playbook lives in the pool
+ * concept "How to use headwater effectively", which this points at. No backticks: it's a JS template
+ * for a plain-text protocol string.
+ */
+export const SERVER_INSTRUCTIONS = [
+  "headwater records how state MOVES between AI surfaces (chats, code sessions, agents) — the handoff, not just the memory.",
+  "KICKOFF: before substantive work call read_project_state(<project>) to load prior decisions, open questions, and pending handoffs. Pin <project> per surface; never infer it from a directory name.",
+  "CAPTURE: as durable decisions emerge call write_concept — ONLY things worth remembering across sessions (decision, architecture, constraint, open_question), never routine chatter or anything already in code/git. Short imperative title; the body states the decision AND the why. Identify yourself with a stable surface label like 'claude-code:<repo>' or 'claude-desktop:<project>'.",
+  "RICH BODIES: a concept body renders a markdown subset (headings, bold/italic/inline code, http links + images, pipe tables) plus mermaid diagram blocks in the viewer — use them so a concept can express itself, not just plain prose.",
+  "REVISE BY FORKING: concepts are immutable — never rewrite one. fork_concept off the parent (kind supersedes / evolved_from / annotates) so history stays a linked tree.",
+  "HAND OFF: open_handoff(concept_ids + directive) passes work to another surface; return_handoff(note) closes the loop. The payload snapshot is frozen at creation.",
+  "OBSERVE: run 'bun run serve' for a local read-and-write viewer at 127.0.0.1 where the operator can browse, filter, and comment/fork/hand off from the page.",
+  'Full playbook: read the concept titled "How to use headwater effectively" (surfaced by read_project_state).',
+].join("\n\n");
+
 export async function startServer(): Promise<void> {
   const db = initDb();
-  const server = new McpServer({ name: "headwater", version: "0.1.0" });
+  const server = new McpServer({ name: "headwater", version: "0.1.0" }, { instructions: SERVER_INSTRUCTIONS });
   registerTools(server, db);
   const transport = new StdioServerTransport();
   await server.connect(transport);
