@@ -18,7 +18,7 @@ import {
   returnHandoff,
   readProjectState,
 } from "../src/server.ts";
-import { renderHtml } from "../src/render.ts";
+import { renderHtml, handleViewerRequest, startViewer } from "../src/render.ts";
 
 let tempDir: string;
 let db: Database;
@@ -467,4 +467,177 @@ test("handoff representations form an exclusive switch (cards by default)", () =
   expect(grouped.length).toBe(3); // cards | table | timeline
   expect(html).toMatch(/<details class="view" name="ho-[^"]+" open><summary>Cards<\/summary>/);
   rdb.close();
+});
+
+// --- Phase 5: the live-viewer write surface (forms -> server.ts functions -> 303 PRG) -------------
+// The live viewer gains native <form> POST actions that call the SAME exported server.ts functions the
+// MCP tools use, so every invariant holds: a "comment" is an `annotates` fork (never an UPDATE), a fork
+// adds a child->parent edge, a handoff freezes its snapshot. Static `bun run render` stays form-free.
+// handleViewerRequest is a pure (Request, db) -> Response unit, tested without binding a socket.
+
+function writePost(path: string, fields: Record<string, string>, headers?: Record<string, string>): Request {
+  return new Request(`http://localhost${path}`, { method: "POST", body: new URLSearchParams(fields), headers });
+}
+
+test("POST /w/fork creates a forks_from child, 303-redirects, and never touches the parent", async () => {
+  const rdb = initDb(":memory:");
+  const parent = writeConcept(rdb, { project: "p", type: "decision", title: "Root", body: "root body", surface: "s" });
+  const res = await handleViewerRequest(writePost("/w/fork", { parent_id: parent.id, body: "a branch" }), rdb);
+  expect(res.status).toBe(303);
+  expect(res.headers.get("location")).toContain("project=p");
+  const edge = rdb.query<{ kind: string }, [string]>("SELECT kind FROM lineage WHERE to_concept_id = ?").get(parent.id);
+  expect(edge?.kind).toBe("forks_from");
+  expect(readConcept(rdb, parent.id)).toEqual(parent); // immutable: parent row unchanged
+  rdb.close();
+});
+
+test("POST /w/comment annotates via a fork — a new node + edge, the parent byte-identical", async () => {
+  const rdb = initDb(":memory:");
+  const parent = writeConcept(rdb, { project: "p", type: "decision", title: "Root", body: "root", surface: "s" });
+  const countBefore = rdb.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM concept").get()!.n;
+  const res = await handleViewerRequest(writePost("/w/comment", { parent_id: parent.id, body: "good point" }), rdb);
+  expect(res.status).toBe(303);
+  const edge = rdb.query<{ kind: string }, [string]>("SELECT kind FROM lineage WHERE to_concept_id = ?").get(parent.id);
+  expect(edge?.kind).toBe("annotates"); // a comment is a fork, never an UPDATE
+  expect(rdb.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM concept").get()!.n).toBe(countBefore + 1);
+  expect(readConcept(rdb, parent.id)).toEqual(parent);
+  rdb.close();
+});
+
+test("POST /w/handoff/open opens a pending handoff carrying the named concept", async () => {
+  const rdb = initDb(":memory:");
+  const c = writeConcept(rdb, { project: "p", type: "note", title: "X", body: "x", surface: "s" });
+  const res = await handleViewerRequest(
+    writePost("/w/handoff/open", { project: "p", from_surface: "operator", to_surface: "claude-code", concept_ids: c.id, directive: "review please" }),
+    rdb,
+  );
+  expect(res.status).toBe(303);
+  const h = rdb.query<{ id: string; status: string; directive: string }, []>("SELECT id, status, directive FROM handoff").get()!;
+  expect(h.status).toBe("pending");
+  expect(h.directive).toBe("review please");
+  expect(rdb.query("SELECT 1 FROM handoff_concept WHERE handoff_id = ? AND concept_id = ?").get(h.id, c.id)).toBeTruthy();
+  rdb.close();
+});
+
+test("POST /w/handoff/return closes a pending handoff while its snapshot stays frozen", async () => {
+  const rdb = initDb(":memory:");
+  const c = writeConcept(rdb, { project: "p", type: "note", title: "X", body: "x", surface: "s" });
+  const ho = openHandoff(rdb, { project: "p", from_surface: "a", to_surface: "b", concept_ids: [c.id], directive: "go" });
+  const res = await handleViewerRequest(writePost("/w/handoff/return", { handoff_id: ho.id, return_note: "done" }), rdb);
+  expect(res.status).toBe(303);
+  const after = rdb
+    .query<{ status: string; return_note: string; payload_snapshot: string }, [string]>(
+      "SELECT status, return_note, payload_snapshot FROM handoff WHERE id = ?",
+    )
+    .get(ho.id)!;
+  expect(after.status).toBe("returned");
+  expect(after.return_note).toBe("done");
+  expect(after.payload_snapshot).toBe(ho.payload_snapshot); // frozen at creation
+  rdb.close();
+});
+
+test("write forms render only in the live viewer; the static page stays form-free", () => {
+  const rdb = initDb(":memory:");
+  const c = writeConcept(rdb, { project: "p", type: "decision", title: "A", body: "a", surface: "s" });
+  openHandoff(rdb, { project: "p", from_surface: "a", to_surface: "b", concept_ids: [c.id], directive: "go" });
+  const live = renderHtml(rdb, { live: true });
+  const stat = renderHtml(rdb);
+  for (const action of ["/w/fork", "/w/comment", "/w/handoff/open", "/w/handoff/return"]) {
+    expect(live).toContain(`action="${action}"`);
+  }
+  expect(stat).not.toContain('method="post"');
+  expect(stat).not.toContain('action="/w/');
+  rdb.close();
+});
+
+test("a malformed write POST is rejected (4xx) and writes nothing", async () => {
+  const rdb = initDb(":memory:");
+  const res = await handleViewerRequest(writePost("/w/fork", { parent_id: "does-not-exist", body: "x" }), rdb);
+  expect(res.status).toBeGreaterThanOrEqual(400);
+  expect(res.status).toBeLessThan(500);
+  expect(rdb.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM concept").get()!.n).toBe(0);
+  rdb.close();
+});
+
+test("an unknown POST path is a 404, not a write", async () => {
+  const rdb = initDb(":memory:");
+  const res = await handleViewerRequest(writePost("/w/nope", { x: "1" }), rdb);
+  expect(res.status).toBe(404);
+  rdb.close();
+});
+
+test("POST /w/handoff/open with an empty concept_ids is rejected (4xx) and opens no handoff", async () => {
+  const rdb = initDb(":memory:");
+  const res = await handleViewerRequest(
+    writePost("/w/handoff/open", { project: "p", from_surface: "operator", to_surface: "b", concept_ids: "", directive: "go" }),
+    rdb,
+  );
+  expect(res.status).toBeGreaterThanOrEqual(400);
+  expect(res.status).toBeLessThan(500);
+  expect(rdb.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM handoff").get()!.n).toBe(0);
+  rdb.close();
+});
+
+test("openHandoff itself refuses an empty concept set (the source-level invariant)", () => {
+  const rdb = initDb(":memory:");
+  expect(() => openHandoff(rdb, { project: "p", from_surface: "a", to_surface: "b", concept_ids: [], directive: "x" })).toThrow(
+    /at least one concept/,
+  );
+  expect(rdb.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM handoff").get()!.n).toBe(0);
+  rdb.close();
+});
+
+test("a handoff opened from the viewer is always attributed to the operator surface, never a submitted value", async () => {
+  const rdb = initDb(":memory:");
+  const c = writeConcept(rdb, { project: "p", type: "note", title: "X", body: "x", surface: "s" });
+  // A forged from_surface in the POST body must be ignored — the origin is hardcoded to the operator.
+  const res = await handleViewerRequest(
+    writePost("/w/handoff/open", { project: "p", from_surface: "claude-code-impersonator", to_surface: "b", concept_ids: c.id, directive: "go" }),
+    rdb,
+  );
+  expect(res.status).toBe(303);
+  const h = rdb.query<{ from_surface_id: string }, []>("SELECT from_surface_id FROM handoff").get()!;
+  expect(h.from_surface_id).toBe("operator");
+  rdb.close();
+});
+
+test("a cross-site write POST is blocked (403) and writes nothing; same-origin/header-less posts pass", async () => {
+  const rdb = initDb(":memory:");
+  const parent = writeConcept(rdb, { project: "p", type: "decision", title: "Root", body: "root", surface: "s" });
+  // A drive-by cross-site form post (browser stamps Sec-Fetch-Site: cross-site) is refused.
+  const blocked = await handleViewerRequest(
+    writePost("/w/comment", { parent_id: parent.id, body: "evil" }, { "sec-fetch-site": "cross-site" }),
+    rdb,
+  );
+  expect(blocked.status).toBe(403);
+  expect(rdb.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM lineage").get()!.n).toBe(0);
+  // A same-origin post (the legitimate form) still goes through.
+  const ok = await handleViewerRequest(
+    writePost("/w/comment", { parent_id: parent.id, body: "kind" }, { "sec-fetch-site": "same-origin" }),
+    rdb,
+  );
+  expect(ok.status).toBe(303);
+  expect(rdb.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM lineage").get()!.n).toBe(1);
+  rdb.close();
+});
+
+test("the live viewer binds to loopback (127.0.0.1), not all interfaces", () => {
+  const prev = process.env.HANDOFF_DATA_DIR;
+  const dir = mkdtempSync(join(tmpdir(), "headwater-bind-"));
+  process.env.HANDOFF_DATA_DIR = dir;
+  const server = startViewer(0); // ephemeral port
+  try {
+    expect(server.hostname).toBe("127.0.0.1");
+  } finally {
+    server.stop(true);
+    if (prev === undefined) delete process.env.HANDOFF_DATA_DIR;
+    else process.env.HANDOFF_DATA_DIR = prev;
+    // startViewer owns its pool handle in a closure (no external close), so on Windows the WAL files
+    // can still be locked here. The assertion is what matters; let the OS reclaim the temp dir.
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
 });

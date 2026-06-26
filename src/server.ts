@@ -231,6 +231,9 @@ export function readProjectState(db: Database, project: string): ProjectState {
  * copy of those concept rows at this moment; handoff_concept rows record the join.
  */
 export function openHandoff(db: Database, args: OpenHandoffArgs): HandoffRow {
+  // A handoff with no concepts carries nothing — a meaningless record. Reject before any upsert so the
+  // pool can never hold an empty handoff (guards both the MCP tool and the viewer's form-POST path).
+  if (args.concept_ids.length === 0) throw new Error("a handoff must carry at least one concept");
   const proj = upsertProject(db, args.project);
   const fromS = upsertSurface(db, args.from_surface);
   const toS = upsertSurface(db, args.to_surface);
@@ -395,7 +398,7 @@ export function registerTools(server: McpServer, db: Database): void {
         project: z.string().describe("Project id or name."),
         from_surface: z.string().describe("Originating surface id or label."),
         to_surface: z.string().describe("Receiving surface id or label."),
-        concept_ids: z.array(z.string()).describe("Concept ids this handoff carries."),
+        concept_ids: z.array(z.string()).min(1).describe("Concept ids this handoff carries (at least one)."),
         directive: z.string().describe("What the receiving surface should do."),
       },
     },

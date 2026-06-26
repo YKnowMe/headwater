@@ -1,12 +1,15 @@
-// render.ts — the read-only observation page.
+// render.ts — the observation page.
 //
 // `bun run render` reads the pool and writes a single static index.html (pure HTML/CSS from
-// template literals — no client JS): concepts grouped by status, the lineage tree
-// (parent -> branches), and the handoff timeline.
+// template literals — no client JS, no forms): concepts grouped by status, the lineage tree
+// (parent -> branches), and the handoff timeline. This output is strictly read-only (only SELECTs).
 //
 // `bun run serve` starts a tiny local viewer (Bun.serve) that re-renders the same page from the
-// pool on every request; in that live mode the page carries a single vanilla-JS Refresh button
-// (location.reload()) — no framework. Either way it is read-only: only SELECTs, never mutates pool data.
+// pool on every request; in that live mode the page carries a vanilla-JS Refresh button
+// (location.reload()) and native <form> write actions — comment (an `annotates` fork), fork, and
+// open/return handoff — that POST to same-origin /w/* routes, call the existing server.ts tool
+// functions, and 303-redirect (PRG). GET renders read-only; only POST writes, and only the live
+// viewer carries forms. The server binds to 127.0.0.1 (unauthenticated localhost; see CLAUDE.md).
 //
 // Regenerate the file:  bun run render        Live view:  bun run serve
 
@@ -14,6 +17,10 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { initDb, nowIso, CONCEPT_STATUSES, CONCEPT_TYPES } from "./db.ts";
 import type { ConceptRow, HandoffRow, LineageRow } from "./db.ts";
+// The live viewer's write surface calls the SAME tool-logic functions the MCP tools use (no new write
+// path, so every invariant — immutability, append-only lineage, frozen snapshots — holds). server.ts
+// imports only ./db.ts, so this stays a clean render -> server -> db DAG (no cycle).
+import { forkConcept, openHandoff, returnHandoff } from "./server.ts";
 
 type ConceptView = ConceptRow & { origin_label: string; project_name: string };
 type LineageView = LineageRow & { child_title: string; parent_title: string };
@@ -186,6 +193,45 @@ function loadHandoffs(db: Database): HandoffView[] {
 
 // --- section renderers ------------------------------------------------------
 
+/**
+ * Live-viewer write actions for one concept, tucked behind a collapsed disclosure so the read-first
+ * page stays clean. Comment is an `annotates` fork and Fork is a `forks_from` fork — both create a NEW
+ * immutable node + lineage edge (never an UPDATE). Hand off opens a pending handoff carrying this
+ * concept. Every dynamic value is esc()'d; all posts go to same-origin /w/* routes. Live viewer only.
+ */
+function renderCardActions(c: ConceptView): string {
+  const pid = esc(c.id);
+  const proj = esc(c.project_id);
+  const typeOpts = CONCEPT_TYPES.map((t) => `<option value="${t}">${t}</option>`).join("");
+  return `
+    <details class="actions">
+      <summary>Act on this concept</summary>
+      <form class="wform" method="post" action="/w/comment">
+        <label>Comment <span class="hint">annotates — a fork, never an edit</span></label>
+        <input type="hidden" name="parent_id" value="${pid}" />
+        <textarea name="body" rows="2" required placeholder="your annotation"></textarea>
+        <button type="submit">Comment</button>
+      </form>
+      <form class="wform" method="post" action="/w/fork">
+        <label>Fork <span class="hint">a new branch off this concept</span></label>
+        <input type="hidden" name="parent_id" value="${pid}" />
+        <input type="text" name="title" placeholder="title (optional — defaults to parent's)" />
+        <select name="type">${typeOpts}</select>
+        <textarea name="body" rows="2" required placeholder="the forked concept body"></textarea>
+        <button type="submit">Fork</button>
+      </form>
+      <form class="wform" method="post" action="/w/handoff/open">
+        <label>Hand off <span class="hint">carry this concept to another surface</span></label>
+        <input type="hidden" name="project" value="${proj}" />
+        <input type="hidden" name="concept_ids" value="${pid}" />
+        <input type="hidden" name="from_surface" value="operator" />
+        <input type="text" name="to_surface" placeholder="to surface (e.g. claude-code)" required />
+        <textarea name="directive" rows="2" required placeholder="directive — what should the receiver do?"></textarea>
+        <button type="submit">Open handoff</button>
+      </form>
+    </details>`;
+}
+
 function renderConceptCard(c: ConceptView, live: boolean): string {
   return `
     <article class="card">
@@ -200,6 +246,7 @@ function renderConceptCard(c: ConceptView, live: boolean): string {
         <span>project: ${esc(c.project_name)}</span>
         <span>${fmtTime(c.created_at)}</span>
       </div>
+      ${live ? renderCardActions(c) : ""}
     </article>`;
 }
 
@@ -284,8 +331,20 @@ function renderLineageSection(edges: LineageView[], key: string): string {
   return `<section><h2>Lineage <span class="count">${edges.length}</span></h2><div class="switch">${views}</div></section>`;
 }
 
-function renderHandoffCard(h: HandoffView): string {
+function renderHandoffCard(h: HandoffView, live: boolean): string {
   const carried = carriedCount(h.payload_snapshot);
+  // Live viewer only: a pending handoff can be closed in place — returnHandoff moves status/return_note
+  // while the frozen directive + payload_snapshot stay untouched (the anti-distortion invariant).
+  const returnForm =
+    live && h.status === "pending"
+      ? `
+        <form class="wform" method="post" action="/w/handoff/return">
+          <label>Return <span class="hint">close the loop — what came back?</span></label>
+          <input type="hidden" name="handoff_id" value="${esc(h.id)}" />
+          <textarea name="return_note" rows="2" required placeholder="return note"></textarea>
+          <button type="submit">Return handoff</button>
+        </form>`
+      : "";
   return `
       <article class="handoff">
         <div class="handoff-head">
@@ -301,6 +360,7 @@ function renderHandoffCard(h: HandoffView): string {
           ${h.returned_at ? `<span>returned: ${fmtTime(h.returned_at)}</span>` : ""}
         </div>
         ${h.return_note ? `<p class="return-note"><strong>Return note:</strong> ${esc(h.return_note)}</p>` : ""}
+        ${returnForm}
       </article>`;
 }
 
@@ -308,12 +368,12 @@ function renderHandoffCard(h: HandoffView): string {
  * Handoffs as an exclusive switch (cards | table | timeline) — the same data, one representation at a
  * time. Native <details name=...> makes the group mutually exclusive, no client JS. Cards open by default.
  */
-function renderHandoffsSection(handoffs: HandoffView[], key: string): string {
+function renderHandoffsSection(handoffs: HandoffView[], key: string, live: boolean): string {
   if (handoffs.length === 0) {
     return `<section><h2>Handoffs</h2><p class="empty">No handoffs yet.</p></section>`;
   }
   const g = `ho-${esc(key)}`;
-  const cards = `<div class="timeline">${handoffs.map(renderHandoffCard).join("")}</div>`;
+  const cards = `<div class="timeline">${handoffs.map((h) => renderHandoffCard(h, live)).join("")}</div>`;
   const svg = buildHandoffTimelineSvg(handoffs);
   const views =
     `<details class="view" name="${g}" open><summary>Cards</summary>${cards}</details>` +
@@ -526,7 +586,7 @@ function renderProjectSection(p: ProjectBucket, opts: { live?: boolean }, open: 
       ${renderConceptsSection(p.concepts, !!opts.live)}
       ${renderMatrix(p.concepts)}
       ${renderLineageSection(p.edges, p.id)}
-      ${renderHandoffsSection(p.handoffs, p.id)}
+      ${renderHandoffsSection(p.handoffs, p.id, !!opts.live)}
     </details>`;
 }
 
@@ -777,6 +837,26 @@ const STYLE = `
   pre.code-block { background: #0f172a; color: #e2e8f0; padding: 10px 12px; border-radius: 8px;
     margin: 8px 0; overflow: auto; white-space: pre;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+
+  /* Live-viewer write actions: collapsed per concept/handoff so the read-first page stays calm.
+     Native form POSTs to /w/* -> server.ts -> 303 PRG. Live viewer only; the static file has no forms. */
+  details.actions { margin: 10px 0 0; border-top: 1px solid var(--line); padding-top: 8px; }
+  details.actions > summary { cursor: pointer; list-style: none; color: var(--accent);
+    font-size: 12.5px; font-weight: 600; padding: 4px 0; }
+  details.actions > summary::-webkit-details-marker { display: none; }
+  details.actions > summary::before { content: "\\25B8  "; color: var(--muted); }
+  details.actions[open] > summary::before { content: "\\25BE  "; }
+  .wform { display: grid; gap: 6px; margin: 10px 0; padding: 10px 12px;
+    background: #fafbfc; border: 1px solid var(--line); border-radius: 8px; }
+  .wform label { font-size: 12.5px; font-weight: 600; color: var(--ink); }
+  .wform .hint { font-weight: 400; color: var(--muted); font-size: 11.5px; }
+  .wform input, .wform textarea, .wform select { font: inherit; font-size: 13px;
+    padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px; width: 100%; }
+  .wform textarea { resize: vertical; min-height: 38px; }
+  .wform button { justify-self: start; cursor: pointer; border: 1px solid var(--accent);
+    background: var(--accent); color: #fff; font: inherit; font-size: 12.5px; font-weight: 600;
+    padding: 6px 14px; border-radius: 7px; }
+  .wform button:hover { background: #245751; border-color: #245751; }
 `;
 
 /**
@@ -848,9 +928,100 @@ export function renderHtml(db: Database, opts: ViewOpts = {}): string {
 
 const DEFAULT_VIEW_PORT = 8765;
 
-/** Handle a viewer request: re-render the page from the pool on every load. */
-function handleViewerRequest(req: Request, db: Database): Response {
+// Operator-originated writes from the viewer are attributed to a single fixed surface. (Per the v1
+// simplification, an upserted surface gets kind "external_agent"; per-connection identity comes later.)
+const OPERATOR_SURFACE = "operator";
+
+function redirect(location: string): Response {
+  // 303 See Other: the browser re-GETs `location`, so a refresh never re-submits the write (PRG).
+  return new Response(null, { status: 303, headers: { location } });
+}
+
+/**
+ * Apply a write from a same-origin form POST, then 303-redirect back to the page (PRG). Every action
+ * routes to an existing server.ts function, so the pool invariants are enforced in one place: a comment
+ * is an `annotates` fork (never an UPDATE), a fork is `forks_from`, a handoff freezes its snapshot.
+ * Any bad input (missing field, unknown parent/handoff, zod rejection) becomes a 400 — the viewer must
+ * never crash on operator input. Redirect targets are built only from server-returned slugs (no
+ * user-controlled host), so this can't be turned into an open redirect.
+ */
+async function handleWrite(req: Request, url: URL, db: Database): Promise<Response> {
+  // Defense-in-depth (not auth): browsers stamp every request with Sec-Fetch-Site, so reject a drive-by
+  // cross-site form POST while the legit same-origin forms (same-origin/same-site/none) pass. Fail open
+  // when the header is absent (non-browser clients, tests) — the real CSRF vector is a browser the
+  // operator points at a malicious page. The 127.0.0.1 bind is still the primary guard. See CLAUDE.md.
+  if (req.headers.get("sec-fetch-site") === "cross-site") {
+    return new Response("forbidden: cross-site write blocked", { status: 403 });
+  }
+  let form: FormData;
+  try {
+    form = await req.formData();
+  } catch {
+    return new Response("bad request: expected a form body", { status: 400 });
+  }
+  const field = (k: string): string => (form.get(k) ?? "").toString().trim();
+  const toProject = (pid: string) => `/?project=${encodeURIComponent(pid)}`;
+  try {
+    switch (url.pathname) {
+      case "/w/comment": {
+        // A comment is a fork with an `annotates` edge — the parent is never modified.
+        const row = forkConcept(db, {
+          parent_id: field("parent_id"),
+          body: field("body"),
+          surface: OPERATOR_SURFACE,
+          kind: "annotates",
+          reason: "observation",
+          type: "note",
+        });
+        return redirect(`${toProject(row.project_id)}#${encodeURIComponent(row.id)}`);
+      }
+      case "/w/fork": {
+        const type = field("type");
+        const title = field("title");
+        const row = forkConcept(db, {
+          parent_id: field("parent_id"),
+          body: field("body"),
+          surface: OPERATOR_SURFACE,
+          kind: "forks_from",
+          type: (CONCEPT_TYPES as readonly string[]).includes(type) ? (type as ConceptRow["type"]) : undefined,
+          title: title || undefined,
+        });
+        return redirect(`${toProject(row.project_id)}#${encodeURIComponent(row.id)}`);
+      }
+      case "/w/handoff/open": {
+        const concept_ids = field("concept_ids").split(/[\s,]+/).filter(Boolean);
+        const row = openHandoff(db, {
+          project: field("project"),
+          // Operator-originated from the viewer: the origin is always the operator surface, never a
+          // submitted value (so a form post can't misattribute who handed off). openHandoff rejects an
+          // empty concept_ids, so this can't mint a handoff that carries nothing.
+          from_surface: OPERATOR_SURFACE,
+          to_surface: field("to_surface"),
+          concept_ids,
+          directive: field("directive"),
+        });
+        return redirect(toProject(row.project_id));
+      }
+      case "/w/handoff/return": {
+        const row = returnHandoff(db, { handoff_id: field("handoff_id"), return_note: field("return_note") });
+        return redirect(toProject(row.project_id));
+      }
+      default:
+        return new Response("not found", { status: 404 });
+    }
+  } catch (err) {
+    return new Response(`write rejected: ${(err as Error).message}`, { status: 400 });
+  }
+}
+
+/**
+ * Handle a viewer request: re-render the page from the pool on every load, plus (live viewer only) apply
+ * same-origin form-POST write actions. Exported so the write/redirect contract is unit-testable as a
+ * pure (Request, db) -> Response function, without binding a socket.
+ */
+export async function handleViewerRequest(req: Request, db: Database): Promise<Response> {
   const url = new URL(req.url);
+  if (req.method === "POST") return handleWrite(req, url, db);
   if (url.pathname === "/vendor/mermaid.min.js") {
     // Serve the vendored Mermaid bundle locally (no CDN) so diagrams render offline.
     return new Response(Bun.file(join(import.meta.dir, "..", "vendor", "mermaid.min.js")), {
@@ -885,9 +1056,12 @@ export function startViewer(
   port: number = Number(process.env.HEADWATER_VIEW_PORT ?? DEFAULT_VIEW_PORT),
 ) {
   const db = initDb();
-  const server = Bun.serve({ port, fetch: (req) => handleViewerRequest(req, db) });
+  // Bind to loopback only: the viewer has write actions and no auth, so it must never be reachable off
+  // this machine. 127.0.0.1 keeps it on the local interface (the deliberate v1 unauthenticated-localhost
+  // posture — see CLAUDE.md). The fetch handler is async (it may apply a write before responding).
+  const server = Bun.serve({ port, hostname: "127.0.0.1", fetch: (req) => handleViewerRequest(req, db) });
   console.error(
-    `headwater viewer live at http://localhost:${server.port}  —  Refresh re-renders from the pool`,
+    `headwater viewer live at http://127.0.0.1:${server.port}  —  Refresh re-renders from the pool`,
   );
   return server;
 }

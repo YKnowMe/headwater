@@ -25,12 +25,19 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
 - `src/render.ts` — reads `pool.db` and writes a static `index.html` via `Bun.write` (`bun run render`).
   Also `bun run serve`: a tiny `Bun.serve` viewer (a runtime built-in, not a web framework) that re-renders
   the page from the pool on every request; in that live mode the page carries one vanilla-JS Refresh button
-  (`location.reload()`) — no framework. Read-only either way (only SELECTs; never mutates pool data).
-  In the live viewer, concept bodies render the escape-first markdown subset + `` ```mermaid `` blocks
-  per the Locked-stack carve-out (the static file shows `` ```mermaid `` source as a code block). The live
-  viewer also honors **read-only** query-param filters (`?project=`/`?type=`/`?status=`/`?surface=`/`?q=`;
-  `q` is a plain SQL `LIKE` substring — not FTS) via a live-only filter bar + GET search form; the static
-  file is the unfiltered snapshot.
+  (`location.reload()`) — no framework. The static `bun run render` output is **read-only** (only SELECTs,
+  no forms). The **live viewer adds a write surface**: native `<form>` POST actions — comment (an
+  `annotates` fork), fork, and open/return handoff — that submit to same-origin `/w/*` routes, call the
+  existing `src/server.ts` tool functions, and `303`-redirect (PRG, so a refresh never re-submits). GET only
+  ever renders; only POST writes; forms render **live-only** (the static file stays form-free). A "comment"
+  is `fork_concept` with `kind='annotates'` — **never** an `UPDATE`, so concept immutability holds. The
+  server binds to **`127.0.0.1`**: unauthenticated localhost is the deliberate v1 posture (a
+  `Sec-Fetch-Site: cross-site` POST is refused as cheap, dependency-free defense-in-depth — not auth;
+  residual same-machine CSRF is accepted for v1). In the live viewer, concept bodies render the escape-first
+  markdown subset + `` ```mermaid `` blocks per the Locked-stack carve-out (the static file shows
+  `` ```mermaid `` source as a code block). The live viewer also honors **read-only** query-param filters
+  (`?project=`/`?type=`/`?status=`/`?surface=`/`?q=`; `q` is a plain SQL `LIKE` substring — not FTS) via a
+  live-only filter bar + GET search form; the static file is the unfiltered snapshot.
 - `src/index.ts` — entry point; calls `startServer()`.
 - `tests/loop.test.ts` — `bun:test` end-to-end smoke test of the full loop against a temp DB.
 - `vendor/mermaid.min.js` — the self-contained Mermaid UMD bundle (a vendored static asset, **not** an
