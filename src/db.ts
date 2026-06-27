@@ -92,9 +92,9 @@ export interface HandoffConceptRow {
 
 export const DEFAULT_DB_FILENAME = "pool.db";
 
-/** Directory that holds the pool. `HANDOFF_DATA_DIR` overrides `~/.workspace`. */
+/** Directory that holds the pool. `HEADWATER_DATA_DIR` overrides `~/.workspace`. */
 export function resolveDataDir(): string {
-  const override = process.env.HANDOFF_DATA_DIR;
+  const override = process.env.HEADWATER_DATA_DIR;
   if (override && override.trim().length > 0) return override;
   return join(homedir(), ".workspace");
 }
@@ -170,13 +170,54 @@ function schemaSql(): string {
     CREATE INDEX IF NOT EXISTS idx_lineage_parent    ON lineage(to_concept_id);
     CREATE INDEX IF NOT EXISTS idx_lineage_child     ON lineage(from_concept_id);
     CREATE INDEX IF NOT EXISTS idx_hc_concept        ON handoff_concept(concept_id);
+
+    -- Invariants enforced at the SUBSTRATE, not just in the tools: a raw \`sqlite3 pool.db "UPDATE ..."\`
+    -- is rejected too, so the integrity claim is literally true of the file. Concepts are immutable,
+    -- lineage + handoff_concept are append-only, and a handoff is frozen except its return transition.
+    CREATE TRIGGER IF NOT EXISTS concept_immutable_update
+      BEFORE UPDATE ON concept
+      BEGIN SELECT RAISE(ABORT, 'concept is immutable: never UPDATE a concept — fork it instead'); END;
+    CREATE TRIGGER IF NOT EXISTS concept_immutable_delete
+      BEFORE DELETE ON concept
+      BEGIN SELECT RAISE(ABORT, 'concept is immutable: never DELETE a concept'); END;
+
+    CREATE TRIGGER IF NOT EXISTS lineage_append_only_update
+      BEFORE UPDATE ON lineage
+      BEGIN SELECT RAISE(ABORT, 'lineage is append-only: never UPDATE a lineage edge'); END;
+    CREATE TRIGGER IF NOT EXISTS lineage_append_only_delete
+      BEFORE DELETE ON lineage
+      BEGIN SELECT RAISE(ABORT, 'lineage is append-only: never DELETE a lineage edge'); END;
+
+    CREATE TRIGGER IF NOT EXISTS handoff_concept_append_only_update
+      BEFORE UPDATE ON handoff_concept
+      BEGIN SELECT RAISE(ABORT, 'handoff_concept is append-only: never UPDATE a carried-concept row'); END;
+    CREATE TRIGGER IF NOT EXISTS handoff_concept_append_only_delete
+      BEFORE DELETE ON handoff_concept
+      BEGIN SELECT RAISE(ABORT, 'handoff_concept is append-only: never DELETE a carried-concept row'); END;
+
+    -- A handoff's frozen fields never move; only status / returned_at / return_note may change.
+    CREATE TRIGGER IF NOT EXISTS handoff_frozen_update
+      BEFORE UPDATE ON handoff
+      WHEN OLD.id               <> NEW.id
+        OR OLD.project_id       <> NEW.project_id
+        OR OLD.from_surface_id  <> NEW.from_surface_id
+        OR OLD.to_surface_id    <> NEW.to_surface_id
+        OR OLD.directive        <> NEW.directive
+        OR OLD.payload_snapshot <> NEW.payload_snapshot
+        OR OLD.initiated_at     <> NEW.initiated_at
+      BEGIN SELECT RAISE(ABORT, 'handoff is frozen: only status/returned_at/return_note may change'); END;
+    CREATE TRIGGER IF NOT EXISTS handoff_no_delete
+      BEFORE DELETE ON handoff
+      BEGIN SELECT RAISE(ABORT, 'handoff is immutable: never DELETE a handoff'); END;
   `;
 }
 
 // --- Connection / init ------------------------------------------------------
 
-/** Bump when the schema changes. Gates one-time DDL via PRAGMA user_version. */
-const SCHEMA_VERSION = 1;
+/** Bump when the schema changes. Gates one-time DDL via PRAGMA user_version. v2 adds the immutability
+ *  triggers; because schemaSql() uses IF NOT EXISTS throughout, an existing v1 pool gains them on its
+ *  next open (re-running the DDL is a no-op for the tables/indexes and just creates the new triggers). */
+const SCHEMA_VERSION = 2;
 
 /**
  * Create the schema exactly once per pool, atomically. The pool is shared across processes (one MCP

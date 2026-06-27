@@ -9,7 +9,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initDb } from "../src/db.ts";
+import { initDb, resolveDataDir } from "../src/db.ts";
 import {
   writeConcept,
   readConcept,
@@ -623,16 +623,16 @@ test("a cross-site write POST is blocked (403) and writes nothing; same-origin/h
 });
 
 test("the live viewer binds to loopback (127.0.0.1), not all interfaces", () => {
-  const prev = process.env.HANDOFF_DATA_DIR;
+  const prev = process.env.HEADWATER_DATA_DIR;
   const dir = mkdtempSync(join(tmpdir(), "headwater-bind-"));
-  process.env.HANDOFF_DATA_DIR = dir;
+  process.env.HEADWATER_DATA_DIR = dir;
   const server = startViewer(0); // ephemeral port
   try {
     expect(server.hostname).toBe("127.0.0.1");
   } finally {
     server.stop(true);
-    if (prev === undefined) delete process.env.HANDOFF_DATA_DIR;
-    else process.env.HANDOFF_DATA_DIR = prev;
+    if (prev === undefined) delete process.env.HEADWATER_DATA_DIR;
+    else process.env.HEADWATER_DATA_DIR = prev;
     // startViewer owns its pool handle in a closure (no external close), so on Windows the WAL files
     // can still be locked here. The assertion is what matters; let the OS reclaim the temp dir.
     try {
@@ -649,4 +649,86 @@ test("the server ships permanent usage instructions every client gets on connect
   expect(SERVER_INSTRUCTIONS).toContain("read_project_state"); // the kickoff ritual
   expect(SERVER_INSTRUCTIONS).toContain("fork_concept"); // the immutability/forking rule
   expect(SERVER_INSTRUCTIONS).toContain("How to use headwater effectively"); // pointer to the in-pool guide
+});
+
+// --- Engine-enforced invariants: the SQLite substrate itself rejects tampering, not just the tools ---
+// The headline claim ("concepts immutable, lineage append-only, handoffs frozen") is enforced by
+// BEFORE UPDATE/DELETE triggers, so a raw `sqlite3 pool.db "UPDATE ..."` is rejected too.
+
+test("the engine rejects a concept UPDATE — immutability is enforced at the substrate", () => {
+  const rdb = initDb(":memory:");
+  const c = writeConcept(rdb, { project: "p", type: "note", title: "X", body: "x", surface: "s" });
+  expect(() => rdb.query("UPDATE concept SET body = 'tampered' WHERE id = ?").run(c.id)).toThrow();
+  expect(readConcept(rdb, c.id).body).toBe("x"); // unchanged
+  rdb.close();
+});
+
+test("the engine rejects a concept DELETE", () => {
+  const rdb = initDb(":memory:");
+  const c = writeConcept(rdb, { project: "p", type: "note", title: "X", body: "x", surface: "s" });
+  expect(() => rdb.query("DELETE FROM concept WHERE id = ?").run(c.id)).toThrow();
+  expect(readConcept(rdb, c.id)).toBeTruthy();
+  rdb.close();
+});
+
+test("the engine rejects UPDATE and DELETE on lineage — append-only at the substrate", () => {
+  const rdb = initDb(":memory:");
+  const parent = writeConcept(rdb, { project: "p", type: "note", title: "P", body: "p", surface: "s" });
+  forkConcept(rdb, { parent_id: parent.id, body: "c", surface: "s" });
+  expect(() => rdb.query("UPDATE lineage SET kind = 'supersedes'").run()).toThrow();
+  expect(() => rdb.query("DELETE FROM lineage").run()).toThrow();
+  rdb.close();
+});
+
+test("the engine freezes a handoff's directive/payload/initiated_at but allows the return transition", () => {
+  const rdb = initDb(":memory:");
+  const c = writeConcept(rdb, { project: "p", type: "note", title: "X", body: "x", surface: "s" });
+  const h = openHandoff(rdb, { project: "p", from_surface: "a", to_surface: "b", concept_ids: [c.id], directive: "go" });
+  expect(() => rdb.query("UPDATE handoff SET directive = 'changed' WHERE id = ?").run(h.id)).toThrow();
+  expect(() => rdb.query("UPDATE handoff SET payload_snapshot = '[]' WHERE id = ?").run(h.id)).toThrow();
+  expect(() => rdb.query("UPDATE handoff SET initiated_at = '2000-01-01' WHERE id = ?").run(h.id)).toThrow();
+  expect(() => rdb.query("DELETE FROM handoff WHERE id = ?").run(h.id)).toThrow();
+  // the legitimate pending -> returned transition (status/returned_at/return_note) still works
+  const r = returnHandoff(rdb, { handoff_id: h.id, return_note: "done" });
+  expect(r.status).toBe("returned");
+  expect(r.return_note).toBe("done");
+  rdb.close();
+});
+
+// --- DNS-rebinding defense: the viewer only answers loopback Hosts -----------------------------------
+// Sec-Fetch-Site blocks classic cross-site CSRF, but a rebound page is *same-origin*; the Host header
+// still reads the attacker's domain, so a Host allowlist is the real fix (on reads and writes).
+
+test("the viewer rejects a non-loopback Host (DNS-rebinding defense), on both writes and reads", async () => {
+  const rdb = initDb(":memory:");
+  const c = writeConcept(rdb, { project: "p", type: "decision", title: "A", body: "a", surface: "s" });
+  // A rebound page is same-origin to itself (Sec-Fetch-Site passes) but its Host is the attacker's domain.
+  const post = new Request("http://evil.example/w/comment", {
+    method: "POST",
+    body: new URLSearchParams({ parent_id: c.id, body: "x" }),
+    headers: { "sec-fetch-site": "same-origin" },
+  });
+  expect((await handleViewerRequest(post, rdb)).status).toBe(403);
+  expect(rdb.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM lineage").get()!.n).toBe(0);
+  // A GET with a foreign Host is also refused (no read-exfiltration via rebinding).
+  expect((await handleViewerRequest(new Request("http://evil.example/"), rdb)).status).toBe(403);
+  rdb.close();
+});
+
+test("the viewer answers loopback Hosts (127.0.0.1 / localhost / [::1], any port)", async () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "p", type: "note", title: "A", body: "a", surface: "s" });
+  for (const origin of ["http://127.0.0.1:8765/", "http://localhost:8765/", "http://127.0.0.1/", "http://[::1]:8765/"]) {
+    expect((await handleViewerRequest(new Request(origin), rdb)).status).toBe(200);
+  }
+  rdb.close();
+});
+
+test("HEADWATER_DATA_DIR overrides the default pool directory (consistent product prefix)", () => {
+  const prev = process.env.HEADWATER_DATA_DIR;
+  const probe = join(tmpdir(), "headwater-env-probe");
+  process.env.HEADWATER_DATA_DIR = probe;
+  expect(resolveDataDir()).toBe(probe);
+  if (prev === undefined) delete process.env.HEADWATER_DATA_DIR;
+  else process.env.HEADWATER_DATA_DIR = prev;
 });

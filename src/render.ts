@@ -1014,6 +1014,25 @@ async function handleWrite(req: Request, url: URL, db: Database): Promise<Respon
   }
 }
 
+// DNS-rebinding defense. The loopback bind keeps us off the network, and Sec-Fetch-Site blocks classic
+// cross-site CSRF — but a page that rebinds its DNS to 127.0.0.1 is treated by the browser as same-origin
+// (so Sec-Fetch-Site reads "same-origin"), while the Host header still carries the attacker's domain. So
+// answer ONLY loopback Hosts; anything else is a rebinding attempt and is refused (on reads and writes).
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+function hostIsLoopback(req: Request, url: URL): boolean {
+  const raw = (req.headers.get("host") ?? url.host).trim().toLowerCase();
+  if (raw === "") return true; // a request with no Host can't be a rebinding attack (which always sends one)
+  let host = raw;
+  if (host.startsWith("[")) {
+    const end = host.indexOf("]");
+    host = end === -1 ? host.slice(1) : host.slice(1, end); // [::1]:port -> ::1
+  } else {
+    const colon = host.lastIndexOf(":");
+    if (colon !== -1) host = host.slice(0, colon); // strip :port
+  }
+  return LOOPBACK_HOSTS.has(host);
+}
+
 /**
  * Handle a viewer request: re-render the page from the pool on every load, plus (live viewer only) apply
  * same-origin form-POST write actions. Exported so the write/redirect contract is unit-testable as a
@@ -1021,6 +1040,8 @@ async function handleWrite(req: Request, url: URL, db: Database): Promise<Respon
  */
 export async function handleViewerRequest(req: Request, db: Database): Promise<Response> {
   const url = new URL(req.url);
+  // First gate, before any routing: reject non-loopback Hosts (DNS-rebinding defense) on every request.
+  if (!hostIsLoopback(req, url)) return new Response("forbidden: non-loopback Host", { status: 403 });
   if (req.method === "POST") return handleWrite(req, url, db);
   if (url.pathname === "/vendor/mermaid.min.js") {
     // Serve the vendored Mermaid bundle locally (no CDN) so diagrams render offline.

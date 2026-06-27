@@ -33,19 +33,20 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
   is `fork_concept` with `kind='annotates'` — **never** an `UPDATE`, so concept immutability holds. The
   server binds to **`127.0.0.1`**: unauthenticated localhost is the deliberate v1 posture (a
   `Sec-Fetch-Site: cross-site` POST is refused as cheap, dependency-free defense-in-depth — not auth;
-  residual same-machine CSRF is accepted for v1). In the live viewer, concept bodies render the escape-first
+  residual same-machine CSRF is accepted for v1), and answers **only loopback Hosts** (a DNS-rebinding
+  defense — a rebound page is same-origin but its Host header is foreign). In the live viewer, concept bodies render the escape-first
   markdown subset + `` ```mermaid `` blocks per the Locked-stack carve-out (the static file shows
   `` ```mermaid `` source as a code block). The live viewer also honors **read-only** query-param filters
   (`?project=`/`?type=`/`?status=`/`?surface=`/`?q=`; `q` is a plain SQL `LIKE` substring — not FTS) via a
   live-only filter bar + GET search form; the static file is the unfiltered snapshot.
 - `src/index.ts` — entry point; calls `startServer()`.
 - `tests/loop.test.ts` — `bun:test` end-to-end smoke test of the full loop against a temp DB.
-- `vendor/mermaid.min.js` — the self-contained Mermaid UMD bundle (a vendored static asset, **not** an
-  npm dep), served by the live viewer to render diagram blocks offline. The only vendored asset; do not
-  add others without a recorded decision.
+- `vendor/mermaid.min.js` — the self-contained Mermaid **v11.15.0** UMD bundle (a vendored static asset,
+  **not** an npm dep; MIT, notice in `vendor/mermaid.LICENSE`), served by the live viewer to render diagram
+  blocks offline. The only vendored asset; do not add others without a recorded decision.
 
 ## Data — one authoritative SQLite pool
-- Lives **outside the repo**: `~/.workspace/pool.db` by default, override with `HANDOFF_DATA_DIR`.
+- Lives **outside the repo**: `~/.workspace/pool.db` by default, override with `HEADWATER_DATA_DIR`.
 - Six tables: `project`, `surface`, `concept`, `lineage`, `handoff`, `handoff_concept`.
 - **Invariants (enforce, never violate):**
   - **Concepts are immutable.** Never `UPDATE` a concept. A fork is a NEW row + a lineage edge.
@@ -54,6 +55,10 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
   - **Handoff `payload_snapshot` and `directive` are frozen at creation.** Only `status`/`returned_at`/
     `return_note` move in place (`pending → returned` in v1).
   - IDs are stable slugs; timestamps are ISO `TEXT`.
+  - **Enforced at the substrate (schema v2).** `BEFORE UPDATE/DELETE` triggers reject any write that
+    violates the above — concept immutable, lineage + `handoff_concept` append-only, handoff frozen except
+    the return transition — so a raw `sqlite3` edit fails too, not just the tool paths. Operator data
+    surgery must drop the relevant trigger first (and is itself a recorded, deliberate act).
 
 ## The six MCP tools
 - `write_concept(project, type, title, body, status="active", surface)` → new immutable concept.

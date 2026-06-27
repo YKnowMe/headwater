@@ -14,8 +14,9 @@ This is **v1** — the smallest thing that closes one real loop:
 TypeScript on **Bun** (package manager + runtime; no build step). The only runtime dependencies are the
 official **MCP TypeScript SDK** and **zod**. Everything else is a Bun built-in: `bun:sqlite` for the pool,
 `bun:test` for tests, `Bun.write` + template literals for the observation page. The live viewer renders
-rich concept bodies and `mermaid` diagrams via one **vendored** static asset (`vendor/mermaid.min.js`)
-served only to the browser — the two runtime dependencies are unchanged.
+rich concept bodies and `mermaid` diagrams via one **vendored** static asset — Mermaid v11.15.0
+(`vendor/mermaid.min.js`, MIT; see `vendor/mermaid.LICENSE`) served only to the browser — so the two
+runtime dependencies are unchanged.
 
 ## Install
 
@@ -28,7 +29,7 @@ bun install
 One authoritative SQLite pool, stored **outside the repo**:
 
 - Default: `~/.workspace/pool.db`
-- Override the directory with the `HANDOFF_DATA_DIR` environment variable.
+- Override the directory with the `HEADWATER_DATA_DIR` environment variable.
 
 The repo holds code only — the pool, `*.db`, and the generated `index.html` are git-ignored.
 
@@ -39,6 +40,8 @@ The repo holds code only — the pool, `*.db`, and the generated `index.html` ar
 Key invariants: **concepts are immutable** (a fork is a new row plus a lineage edge — the original is never
 touched), **lineage is append-only** (child → parent edges; the original is the canonical root), and a
 handoff's `payload_snapshot` + `directive` are **frozen at creation** (only its status/return fields move).
+These are enforced **at the substrate** by SQLite triggers — a raw `sqlite3 pool.db "UPDATE …"` is rejected
+too, not just the tool paths — so the integrity claim holds of the file itself.
 
 ## MCP tools (six)
 
@@ -89,7 +92,7 @@ for the full architecture and scope fence.
 
 headwater is a **stdio** MCP server launched with `bun run`. Point your client at the entry file by
 **absolute path** (so it works regardless of the client's working directory). The pool lives at
-`~/.workspace/pool.db` no matter where the server is started; set `HANDOFF_DATA_DIR` to relocate it.
+`~/.workspace/pool.db` no matter where the server is started; set `HEADWATER_DATA_DIR` to relocate it.
 
 ### Claude Desktop
 
@@ -108,7 +111,7 @@ Edit `claude_desktop_config.json` (Settings → Developer → Edit Config) and a
 
 Replace `/absolute/path/to/headwater` with the absolute path to your clone. On Windows, use an escaped
 absolute path, e.g. `"args": ["run", "C:\\Users\\you\\headwater\\src\\index.ts"]`. To relocate the pool,
-add `"env": { "HANDOFF_DATA_DIR": "/custom/path" }`. Restart Claude Desktop to pick up the change.
+add `"env": { "HEADWATER_DATA_DIR": "/custom/path" }`. Restart Claude Desktop to pick up the change.
 
 ### Claude Code
 
@@ -120,7 +123,7 @@ claude mcp add headwater -- bun run /absolute/path/to/headwater/src/index.ts
 
 Replace `/absolute/path/to/headwater` with the absolute path to your clone (a Windows absolute path on
 Windows). Equivalently, commit a project-scoped `.mcp.json` with the same shape as the Claude Desktop
-snippet above. Override the pool location with `--env HANDOFF_DATA_DIR=/custom/path`. Verify with
+snippet above. Override the pool location with `--env HEADWATER_DATA_DIR=/custom/path`. Verify with
 `claude mcp list`.
 
 > For local development from the repo root, `bun run start` launches the same server.
@@ -140,8 +143,12 @@ host or the network. With that boundary:
 - Concept bodies render **escape-first**: text is HTML-escaped first, then a fixed whitelist of tags is
   reintroduced. Images and links are accepted only with `http(s)` URLs — no raw HTML, `javascript:`, or
   `data:` URLs reach the page, and the vendored Mermaid runs with `securityLevel: 'strict'`.
-- Write actions are `POST`-only with a 303 redirect (a refresh never re-submits); a cross-site `POST`
-  is rejected via `Sec-Fetch-Site` as cheap defense-in-depth.
+- Write actions are `POST`-only with a 303 redirect (a refresh never re-submits). The viewer answers
+  **only loopback Hosts** (a DNS-rebinding defense), and a cross-site `POST` is additionally rejected via
+  `Sec-Fetch-Site`.
+- **Immutability is enforced at the substrate**: SQLite triggers reject any `UPDATE`/`DELETE` that would
+  rewrite a concept, a lineage edge, or a handoff's frozen fields — so tampering fails even outside the
+  tools.
 - The pool lives outside the repo and all SQLite files are git-ignored, so data never lands in version
   control.
 
