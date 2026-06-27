@@ -28,7 +28,9 @@
     "start": "bun run src/index.ts",
     "render": "bun run src/render.ts",
     "serve": "bun run src/render.ts serve",
-    "test": "bun test"
+    "test": "bun test",
+    "demo": "HEADWATER_DATA_DIR=.demo bun run scripts/seed-demo.ts",
+    "demo:serve": "HEADWATER_DATA_DIR=.demo bun run src/render.ts serve"
   },
   "devDependencies": {
     "@types/bun": "latest"

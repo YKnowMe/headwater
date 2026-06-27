@@ -9,6 +9,29 @@ between surfaces, where they came from (lineage), and the handoffs that carry th
 This is **v1** — the smallest thing that closes one real loop:
 **write a concept → recall it → fork it → hand it off → return the handoff**, all observable in a local viewer.
 
+## Demo
+
+![headwater demo](docs/demo.gif)
+
+One command seeds a disposable, repo-local pool (`.demo/`, git-ignored — **never your real pool**) with a
+small *checkout redesign* moving between a planning chat and a coding session, then serves the page:
+
+```sh
+bun install
+bun run demo          # seed .demo/ with the example (wipes + repopulates, so re-running is safe)
+bun run demo:serve    # live viewer — open the printed http://127.0.0.1:8765
+```
+
+What to look at:
+
+- **Lineage tree** — the locked root checkout decision with a **supersede** branch (a refined version; the
+  original stays the canonical root) and a separate **operator annotation**: immutability-by-fork, made visible.
+- **Handoff timeline** — one **returned** loop (planning → code, implemented) and one **pending** loop (an
+  open product question awaiting a call).
+- **Rich bodies** — expand *Checkout state machine* for a rendered **Mermaid** diagram; the payment decision
+  carries a **pipe table**.
+- **Type × status matrix** — fills in across decisions, architecture, a constraint, and a parked question.
+
 ## Stack
 
 TypeScript on **Bun** (package manager + runtime; no build step). The only runtime dependencies are the

@@ -8,6 +8,9 @@ node_modules
 *.db-shm
 *.db-wal
 
+# the runnable demo (`bun run demo`) seeds a disposable, repo-local pool here
+.demo/
+
 # generated observation page (produced by `bun run render`)
 index.html
 
