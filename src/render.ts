@@ -69,9 +69,38 @@ function clip(s: string, n: number): string {
 // text, so no raw "/'/</> survive — the page can never receive raw HTML/SVG from a concept body. URLs
 // must start http(s):// (javascript:/data: are left as inert text, never an attribute).
 
+/**
+ * Resolve a [[wikilink]] slug to an in-page anchor id, or null when the pool has no such node.
+ * Exact concept/handoff ids win; a concept id written without its hash suffix (the common way bodies
+ * cite each other) resolves by prefix, earliest-created first, so links stay stable as the pool grows.
+ */
+type WikiResolve = (slug: string) => string | null;
+
+function buildWikiResolver(db: Database): WikiResolve {
+  // Resolution is always against the WHOLE pool (not the current filter), so a scoped live view
+  // never turns a real reference into a ghost.
+  const conceptIds = db.query<{ id: string }, []>(`SELECT id FROM concept ORDER BY created_at ASC`).all().map((r) => r.id);
+  const handoffIds = new Set(db.query<{ id: string }, []>(`SELECT id FROM handoff`).all().map((r) => r.id));
+  const exact = new Set(conceptIds);
+  return (slug) => {
+    if (exact.has(slug) || handoffIds.has(slug)) return slug;
+    return conceptIds.find((id) => id.startsWith(slug + "-")) ?? null;
+  };
+}
+
 /** Inline formatting on one line. Escapes first; nothing below can introduce a raw `<` or `"`. */
-function inline(raw: string): string {
+function inline(raw: string, resolve?: WikiResolve): string {
   let s = esc(raw);
+  // [[wikilinks]] first (slug charset only — already-escaped text can't smuggle quotes into href).
+  // Resolved -> anchor link to the node's card; dangling -> the ghost grammar (dashed, tooltip).
+  if (resolve) {
+    s = s.replace(/\[\[([A-Za-z0-9][A-Za-z0-9_-]*)\]\]/g, (_m, slug) => {
+      const target = resolve(slug);
+      return target
+        ? `<a class="wl" href="#${target}">[[${slug}]]</a>`
+        : `<span class="wl-ghost" title="referenced concept id not present in the pool">[[${slug}]]</span>`;
+    });
+  }
   s = s.replace(/!\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g,
     (_m, alt, url) => `<img src="${url}" alt="${alt}" loading="lazy" referrerpolicy="no-referrer">`);
   s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
@@ -86,18 +115,23 @@ function splitCells(row: string): string[] {
   return row.replace(/^\s*\|?/, "").replace(/\|?\s*$/, "").split("|").map((c) => c.trim());
 }
 
-function renderMdTable(header: string[], rows: string[][]): string {
-  const th = header.map((c) => `<th>${inline(c)}</th>`).join("");
-  const trs = rows.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("");
+function renderMdTable(header: string[], rows: string[][], resolve?: WikiResolve): string {
+  const th = header.map((c) => `<th>${inline(c, resolve)}</th>`).join("");
+  const trs = rows.map((r) => `<tr>${r.map((c) => `<td>${inline(c, resolve)}</td>`).join("")}</tr>`).join("");
   return `<table class="md"><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table>`;
 }
+
+// Checklist markdown before plain bullets — a task line is also a bullet line, so order matters.
+const TASK_ITEM = /^\s*[-*]\s+\[( |x|X)\]\s+(.*)$/;
+const BULLET_ITEM = /^\s*[-*]\s+(.*)$/;
+const ORDERED_ITEM = /^\s*\d+[.)]\s+(.*)$/;
 
 /**
  * Render a concept body: images (http(s) only), http links, bold/italic/code, headings, pipe-tables,
  * and fenced blocks. A ```mermaid block becomes a live <pre class="mermaid"> (rendered client-side by
  * the vendored strict Mermaid) when `live`, else a static code block. See the CLAUDE.md carve-out.
  */
-function renderRichBody(body: string, live: boolean): string {
+function renderRichBody(body: string, live: boolean, resolve?: WikiResolve): string {
   const lines = body.split("\n");
   const out: string[] = [];
   let i = 0;
@@ -120,20 +154,48 @@ function renderRichBody(body: string, live: boolean): string {
       i += 2; // header + separator
       const rows: string[][] = [];
       while (i < lines.length && lines[i]!.includes("|") && lines[i]!.trim() !== "") { rows.push(splitCells(lines[i]!)); i++; }
-      out.push(renderMdTable(header, rows));
+      out.push(renderMdTable(header, rows, resolve));
       continue;
     }
     const hm = /^(#{1,6})\s+(.*)$/.exec(line);
-    if (hm) { out.push(`<h4 class="md-h">${inline(hm[2]!)}</h4>`); i++; continue; }
-    out.push(inline(line));
+    if (hm) { out.push(`<h4 class="md-h">${inline(hm[2]!, resolve)}</h4>`); i++; continue; }
+    // List run: consume consecutive list lines, then emit one list element per same-flavor segment.
+    // Checklist items become the task grammar (registry concepts — see the Design pass); flat only,
+    // no nesting — that stays outside the subset.
+    if (TASK_ITEM.test(line) || ORDERED_ITEM.test(line) || BULLET_ITEM.test(line)) {
+      const items: Array<{ flavor: "task" | "ul" | "ol"; html: string }> = [];
+      while (i < lines.length) {
+        const l = lines[i]!;
+        let m: RegExpExecArray | null;
+        if ((m = TASK_ITEM.exec(l))) {
+          const done = m[1] !== " " ? ' class="done"' : "";
+          items.push({ flavor: "task", html: `<li${done}><span class="task-text">${inline(m[2]!, resolve)}</span></li>` });
+        } else if ((m = ORDERED_ITEM.exec(l))) {
+          items.push({ flavor: "ol", html: `<li>${inline(m[1]!, resolve)}</li>` });
+        } else if ((m = BULLET_ITEM.exec(l))) {
+          items.push({ flavor: "ul", html: `<li>${inline(m[1]!, resolve)}</li>` });
+        } else break;
+        i++;
+      }
+      let j = 0;
+      while (j < items.length) {
+        const flavor = items[j]!.flavor;
+        const seg: string[] = [];
+        while (j < items.length && items[j]!.flavor === flavor) { seg.push(items[j]!.html); j++; }
+        const lis = seg.join("");
+        out.push(flavor === "ol" ? `<ol>${lis}</ol>` : flavor === "task" ? `<ul class="tasks">${lis}</ul>` : `<ul>${lis}</ul>`);
+      }
+      continue;
+    }
+    out.push(inline(line, resolve));
     i++;
   }
   return out.join("\n");
 }
 
 const BODY_CLAMP = 280;
-function renderBody(body: string, live: boolean): string {
-  const rich = renderRichBody(body, live);
+function renderBody(body: string, live: boolean, resolve?: WikiResolve): string {
+  const rich = renderRichBody(body, live, resolve);
   if (body.length <= BODY_CLAMP) return `<div class="card-body">${rich}</div>`;
   return `<details class="card-body"><summary class="body-summary">${esc(flatPreview(body))}</summary><div class="body-full">${rich}</div></details>`;
 }
@@ -232,14 +294,15 @@ function renderCardActions(c: ConceptView): string {
     </details>`;
 }
 
-function renderConceptCard(c: ConceptView, live: boolean): string {
+function renderConceptCard(c: ConceptView, live: boolean, resolve?: WikiResolve): string {
+  // The card's id is the concept id — the anchor every resolved [[wikilink]] points at.
   return `
-    <article class="card">
+    <article class="card" id="${esc(c.id)}">
       <div class="card-head">
         ${badge(c.type, "type")}
         <h3 class="card-title">${esc(c.title)}</h3>
       </div>
-      ${renderBody(c.body, live)}
+      ${renderBody(c.body, live, resolve)}
       <div class="meta">
         <code class="id">${esc(c.id)}</code>
         <span>origin: ${esc(c.origin_label)}</span>
@@ -254,15 +317,15 @@ function renderConceptCard(c: ConceptView, live: boolean): string {
 // more" disclosure so a 200-concept group can't blow out the page (every card stays one click away).
 const CARD_CAP = 12;
 
-function renderCards(items: ConceptView[], live: boolean): string {
-  const cards = items.map((c) => renderConceptCard(c, live));
+function renderCards(items: ConceptView[], live: boolean, resolve?: WikiResolve): string {
+  const cards = items.map((c) => renderConceptCard(c, live, resolve));
   if (cards.length <= CARD_CAP) return `<div class="cards">${cards.join("")}</div>`;
   const head = cards.slice(0, CARD_CAP).join("");
   const rest = cards.slice(CARD_CAP).join("");
   return `<div class="cards">${head}</div><details class="more"><summary>Show ${cards.length - CARD_CAP} more</summary><div class="cards">${rest}</div></details>`;
 }
 
-function renderConceptsSection(concepts: ConceptView[], live: boolean): string {
+function renderConceptsSection(concepts: ConceptView[], live: boolean, resolve?: WikiResolve): string {
   if (concepts.length === 0) {
     return `<section><h2>Concepts</h2><p class="empty">No concepts yet.</p></section>`;
   }
@@ -272,7 +335,7 @@ function renderConceptsSection(concepts: ConceptView[], live: boolean): string {
     return `
       <div class="status-group">
         <h3 class="status-head">${badge(status, `st-${status}`)} <span class="count">${items.length}</span></h3>
-        ${renderCards(items, live)}
+        ${renderCards(items, live, resolve)}
       </div>`;
   }).join("");
   return `<section><h2>Concepts <span class="count">${concepts.length}</span></h2>${groups}</section>`;
@@ -346,7 +409,7 @@ function renderHandoffCard(h: HandoffView, live: boolean): string {
         </form>`
       : "";
   return `
-      <article class="handoff">
+      <article class="handoff" id="${esc(h.id)}">
         <div class="handoff-head">
           <span class="route">${esc(h.from_label)} <span class="arrow">&rarr;</span> ${esc(h.to_label)}</span>
           ${badge(h.status, `ho-${h.status}`)}
@@ -577,13 +640,13 @@ function groupByProject(concepts: ConceptView[], lineage: LineageView[], handoff
 
 /** One project's whole slice: a collapsible section wrapping its concepts, lineage, and handoffs.
  *  `open` is decided by the caller — small pools stay expanded, large ones collapse to a scannable index. */
-function renderProjectSection(p: ProjectBucket, opts: { live?: boolean }, open: boolean): string {
+function renderProjectSection(p: ProjectBucket, opts: { live?: boolean }, open: boolean, resolve?: WikiResolve): string {
   const counts = `${p.concepts.length}c · ${p.edges.length}l · ${p.handoffs.length}h`;
   const focus = opts.live ? ` <a class="focus" href="/?project=${encodeURIComponent(p.id)}">focus</a>` : "";
   return `
     <details class="project" id="proj-${esc(p.id)}"${open ? " open" : ""}>
       <summary><span class="proj-name">${esc(p.name)}</span> <span class="count">${counts}</span>${focus}</summary>
-      ${renderConceptsSection(p.concepts, !!opts.live)}
+      ${renderConceptsSection(p.concepts, !!opts.live, resolve)}
       ${renderMatrix(p.concepts)}
       ${renderLineageSection(p.edges, p.id)}
       ${renderHandoffsSection(p.handoffs, p.id, !!opts.live)}
@@ -825,6 +888,22 @@ const STYLE = `
   .tl-label { font-size: 11px; fill: var(--ink); }
 
   /* Rich concept bodies: escape-first markdown subset + mermaid (the carve-out). */
+  /* lists inside concept bodies (white-space: normal — the pre-wrap parent must not add breaks) */
+  .card-body ul, .card-body ol, .body-full ul, .body-full ol { margin: 6px 0; padding-left: 22px; white-space: normal; }
+  .card-body li, .body-full li { margin: 3px 0; }
+  /* task list — checklist markdown as checkboxes; registries are concepts kept current by supersede-forks */
+  ul.tasks { list-style: none; padding-left: 4px; }
+  ul.tasks li { display: flex; gap: 9px; align-items: baseline; margin: 5px 0; }
+  ul.tasks li::before { content: ""; flex: 0 0 auto; width: 13px; height: 13px; border-radius: 4px;
+    border: 1.5px solid var(--muted); background: #fff; transform: translateY(2px); }
+  ul.tasks li.done::before { content: "\\2713"; background: #1f7a47; border-color: #1f7a47; color: #fff;
+    font-size: 10px; line-height: 13px; text-align: center; }
+  ul.tasks li.done { color: var(--muted); }
+  ul.tasks li.done .task-text { text-decoration: line-through; text-decoration-color: #b9c0cc; }
+  /* wikilinks: resolved -> accent anchor; dangling -> the ghost grammar (dashed = expected-but-not-present) */
+  a.wl { color: var(--accent); text-decoration-thickness: 1px; }
+  .wl-ghost { color: #8b93a5; border-bottom: 1px dashed #8b93a5; cursor: help; }
+  .wl-ghost::after { content: " ?"; font-size: 11px; vertical-align: super; font-weight: 700; }
   .card-body img, .body-full img { max-width: 100%; height: auto; display: block;
     border: 1px solid var(--line); border-radius: 8px; margin: 8px 0; }
   .card-body a, .body-full a { color: var(--accent); }
@@ -888,9 +967,10 @@ export function renderHtml(db: Database, opts: ViewOpts = {}): string {
   // Small pools stay open and scannable; large ones collapse to an index of project headers. A
   // project scoped via ?project= is always open.
   const isOpen = (p: ProjectBucket) => projects.length <= 3 || opts.only === p.id;
+  const resolve = buildWikiResolver(db);
   const sections =
     shown.length > 0
-      ? shown.map((p) => renderProjectSection(p, opts, isOpen(p))).join("")
+      ? shown.map((p) => renderProjectSection(p, opts, isOpen(p), resolve)).join("")
       : `<p class="empty">Nothing in the pool yet.</p>`;
 
   return `<!doctype html>

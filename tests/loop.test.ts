@@ -332,6 +332,92 @@ test("mermaid blocks render live as <pre class=\"mermaid\"> with the script; sta
   rdb.close();
 });
 
+// --- render.ts: concept-body content types (lists, checklists, wikilinks) — the settled Design pass.
+// Task registries are ordinary concepts kept current by supersede-forks (no new entity); the ONLY new
+// machinery is presentation: checklist markdown -> styled checkboxes, list markdown -> real lists, and
+// [[wikilinks]] resolved against the pool (link) or not (ghost). Same escape-first rules as the rest.
+
+test("rich body renders bulleted and numbered list runs as real lists", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, {
+    project: "p", type: "note", title: "lists", surface: "s",
+    body: "1. first step\n2. second step\n- alpha\n- beta",
+  });
+  const html = renderHtml(rdb);
+  expect(html).toContain("<ol><li>first step</li><li>second step</li></ol>");
+  expect(html).toContain("<ul><li>alpha</li><li>beta</li></ul>");
+  rdb.close();
+});
+
+test("checklist markdown renders as a task list; done items are marked, text preserved", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, {
+    project: "p", type: "note", title: "registry", surface: "s",
+    body: "- [x] shipped thing\n- [ ] open thing",
+  });
+  const html = renderHtml(rdb);
+  expect(html).toContain('<ul class="tasks">');
+  expect(html).toContain('<li class="done"><span class="task-text">shipped thing</span></li>');
+  expect(html).toContain('<li><span class="task-text">open thing</span></li>');
+  rdb.close();
+});
+
+test("task and list items get inline formatting and stay injection-safe", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, {
+    project: "p", type: "note", title: "safe", surface: "s",
+    body: "- [x] closed by `abc-123`\n- [ ] <script>alert(1)</script>",
+  });
+  const html = renderHtml(rdb);
+  expect(html).toContain('<span class="task-text">closed by <code>abc-123</code></span>');
+  expect(html).not.toContain("<script>alert(1)");
+  expect(html).toContain('<span class="task-text">&lt;script&gt;alert(1)&lt;/script&gt;</span>');
+  rdb.close();
+});
+
+test("a wikilink to a concept id in the pool links to that concept's anchored card", () => {
+  const rdb = initDb(":memory:");
+  const target = writeConcept(rdb, { project: "p", type: "decision", title: "Adopt Bun", body: "t", surface: "s" });
+  writeConcept(rdb, { project: "p", type: "note", title: "ref", body: `see [[${target.id}]] for context`, surface: "s" });
+  const html = renderHtml(rdb);
+  expect(html).toContain(`<a class="wl" href="#${target.id}">[[${target.id}]]</a>`);
+  expect(html).toContain(`id="${target.id}"`); // the card carries the anchor the link points at
+  rdb.close();
+});
+
+test("a wikilink written without the id's hash suffix still resolves (prefix match)", () => {
+  const rdb = initDb(":memory:");
+  const target = writeConcept(rdb, { project: "p", type: "decision", title: "Adopt Bun", body: "t", surface: "s" });
+  const prefix = target.id.slice(0, target.id.lastIndexOf("-")); // e.g. "adopt-bun"
+  writeConcept(rdb, { project: "p", type: "note", title: "ref", body: `see [[${prefix}]]`, surface: "s" });
+  const html = renderHtml(rdb);
+  expect(html).toContain(`<a class="wl" href="#${target.id}">[[${prefix}]]</a>`);
+  rdb.close();
+});
+
+test("a dangling wikilink renders as a ghost (dashed, tooltip), never a link", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "p", type: "note", title: "ref", body: "see [[fts-introduction-plan]]", surface: "s" });
+  const html = renderHtml(rdb);
+  expect(html).toContain(
+    '<span class="wl-ghost" title="referenced concept id not present in the pool">[[fts-introduction-plan]]</span>',
+  );
+  expect(html).not.toContain('href="#fts-introduction-plan"');
+  expect(html).toMatch(/\.wl-ghost[^}]*dashed/); // the ghost grammar: dashed = expected-but-not-present
+  rdb.close();
+});
+
+test("a wikilink naming a handoff id resolves to the handoff's anchored entry", () => {
+  const rdb = initDb(":memory:");
+  const c = writeConcept(rdb, { project: "p", type: "note", title: "X", body: "x", surface: "s1" });
+  const h = openHandoff(rdb, { project: "p", from_surface: "s1", to_surface: "s2", concept_ids: [c.id], directive: "go" });
+  writeConcept(rdb, { project: "p", type: "note", title: "ref", body: `loop: [[${h.id}]]`, surface: "s1" });
+  const html = renderHtml(rdb);
+  expect(html).toContain(`<a class="wl" href="#${h.id}">[[${h.id}]]</a>`);
+  expect(html).toContain(`id="${h.id}"`);
+  rdb.close();
+});
+
 // --- db.ts: the shared pool must survive concurrent opens by multiple server processes ---
 
 test("initDb sets a busy_timeout so concurrent processes wait for the lock instead of crashing", () => {
