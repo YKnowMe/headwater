@@ -11,8 +11,9 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
   template literals (static HTML). No web framework, no ORM, no extra libraries.
 - **Carve-out (deliberate, operator-approved — see the superseding concept in the pool):** the live
   `bun run serve` viewer renders rich concept bodies — a fixed escape-first markdown subset (images via
-  `http(s)` URLs, pipe-tables, bold/italic/`code`/links) parsed server-side, and `` ```mermaid `` diagram
-  blocks rendered **client-side** by a **vendored** Mermaid bundle (`vendor/mermaid.min.js`,
+  `http(s)` URLs, pipe-tables, bold/italic/`code`/links, flat bullet/numbered lists, `- [ ]`/`- [x]`
+  checklists, `[[concept-id]]` wikilinks resolved against the whole pool) parsed server-side, and
+  `` ```mermaid `` diagram blocks rendered **client-side** by a **vendored** Mermaid bundle (`vendor/mermaid.min.js`,
   `securityLevel: 'strict'`, **live-viewer only**). This is the single allowed exception to "no client JS /
   no graph-viz library". The two Bun runtime deps are unchanged — Mermaid is a vendored static asset served
   to the browser, not a server/runtime import. The static `bun run render` file stays pure HTML/CSS and
@@ -39,6 +40,13 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
   `` ```mermaid `` source as a code block). The live viewer also honors **read-only** query-param filters
   (`?project=`/`?type=`/`?status=`/`?surface=`/`?q=`; `q` is a plain SQL `LIKE` substring — not FTS) via a
   live-only filter bar + GET search form; the static file is the unfiltered snapshot.
+  **Canonical representations (settled design — do not re-add variants):** lineage renders as ONE tree and
+  handoffs as ONE vertical spine timeline; the old cards/table/SVG and tree/diagram/table switches were
+  deliberately pruned. Each handoff expands in place (native `<details>`) to its evidence — frozen
+  `payload_snapshot` panes beside each carried concept's current node with a computed drift verdict, plus
+  the return note. Ghost grammar (dashed + italic + hollow) marks expected-but-not-present: a pending
+  handoff's terminus, its expected-return branch in the tree, and dangling `[[wikilinks]]`. Wikilink/drift
+  resolution is always whole-pool, never the current filter.
 - `src/index.ts` — entry point; calls `startServer()`.
 - `tests/loop.test.ts` — `bun:test` end-to-end smoke test of the full loop against a temp DB.
 - `vendor/mermaid.min.js` — the self-contained Mermaid **v11.15.0** UMD bundle (a vendored static asset,
@@ -66,6 +74,9 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
   → new concept (same project as parent) + a lineage edge new→parent. Original untouched.
 - `read_concept(id)` → the concept node (recall-by-id is first-class).
 - `read_project_state(project)` → kickoff context: concepts grouped by status, pending handoffs, recents.
+  Bodies arrive as bounded `body_preview`s (the kickoff is a map, not the archive); `read_concept` recalls
+  the full text — this applies to frozen snapshot concepts inside handoffs too (presentation only; stored
+  rows and snapshots stay whole).
 - `open_handoff(project, from_surface, to_surface, concept_ids, directive)` → `pending` handoff with a
   frozen JSON `payload_snapshot` of the named concepts + `handoff_concept` join rows.
 - `return_handoff(handoff_id, return_note)` → `status=returned`, `returned_at=now`, `return_note`.

@@ -97,10 +97,14 @@ Observe concepts (grouped by status), the lineage tree, and the handoff timeline
 The live viewer is **read + write**, and richer than the static snapshot:
 
 - **Rich concept bodies** — a body renders an escape-first markdown subset (headings, bold/italic/`code`,
-  http(s) links + images, pipe tables) plus `mermaid` diagrams (rendered client-side by the vendored
-  bundle). The static snapshot shows `mermaid` source as a code block.
-- **Browse & filter** — faceted filters by type/status/surface and a plain substring search (`?q=`),
-  plus a switch between tree / diagram / table views of lineage and handoffs.
+  http(s) links + images, pipe tables, bullet/numbered lists, `- [ ]`/`- [x]` checklists) plus `mermaid`
+  diagrams (rendered client-side by the vendored bundle; the static snapshot shows the source as a code
+  block). `[[concept-id]]` citations resolve to in-page links — a dangling citation renders as a ghost.
+- **The handoff is the interaction target** — each handoff on the timeline expands in place to its
+  evidence: the frozen payload beside each carried concept's *current* node with a computed drift
+  verdict, and the return note (or the open loop's ghost). Lineage is one tree; a pending handoff
+  hangs a dashed "expected return" ghost branch off what it carries.
+- **Browse & filter** — faceted filters by type/status/surface and a plain substring search (`?q=`).
 - **Write actions** — comment (an `annotates` fork), fork, and open/return a handoff straight from a
   card. A comment is a fork, never an edit, so concept immutability still holds; the static snapshot
   stays form-free.

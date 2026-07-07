@@ -819,6 +819,50 @@ test("the server ships permanent usage instructions every client gets on connect
   expect(SERVER_INSTRUCTIONS).toContain("read_project_state"); // the kickoff ritual
   expect(SERVER_INSTRUCTIONS).toContain("fork_concept"); // the immutability/forking rule
   expect(SERVER_INSTRUCTIONS).toContain("How to use headwater effectively"); // pointer to the in-pool guide
+  expect(SERVER_INSTRUCTIONS).toContain("[[concept-id]]"); // the cite-by-id convention feeds link/ghost rendering
+  expect(SERVER_INSTRUCTIONS).toContain("read_concept"); // kickoff bodies are previews; this is full recall
+});
+
+// --- read_project_state stays context-sized: bodies are previews, read_concept is full recall ------
+// Observed failure: a mature pool's kickoff result blew past a client's context budget because every
+// concept (and every frozen snapshot concept) carried its full body. The kickoff is a MAP of the
+// project, not the archive — bodies arrive as bounded previews and read_concept(id) recalls the rest.
+
+test("read_project_state previews long bodies instead of shipping them whole", () => {
+  const rdb = initDb(":memory:");
+  const long = "start-marker " + "x".repeat(2000) + " end-marker";
+  const c = writeConcept(rdb, { project: "big", type: "note", title: "LONG", body: long, surface: "s" });
+  const state = readProjectState(rdb, "big");
+  const inState = state.concepts_by_status.active[0]!;
+  expect(inState.body_preview.length).toBeLessThanOrEqual(281); // bounded (280 + ellipsis char)
+  expect(inState.body_preview).toContain("start-marker");
+  expect(inState.body_preview.endsWith("…")).toBe(true);
+  expect("body" in inState).toBe(false); // no full body riding along
+  expect(JSON.stringify(state)).not.toContain("end-marker");
+  // full recall stays first-class
+  expect(readConcept(rdb, c.id).body).toBe(long);
+  rdb.close();
+});
+
+test("read_project_state previews the frozen snapshot bodies inside handoffs too; directives stay whole", () => {
+  const rdb = initDb(":memory:");
+  const long = "cargo-head " + "y".repeat(2000) + " cargo-tail";
+  const c = writeConcept(rdb, { project: "big", type: "note", title: "CARGO", body: long, surface: "s" });
+  openHandoff(rdb, { project: "big", from_surface: "a", to_surface: "b", concept_ids: [c.id], directive: "do the thing" });
+  const state = readProjectState(rdb, "big");
+  const ho = state.open_handoffs[0]! as { directive: string; payload_snapshot: Array<{ body_preview: string }> };
+  expect(ho.directive).toBe("do the thing");
+  expect(ho.payload_snapshot[0]!.body_preview).toContain("cargo-head");
+  expect(JSON.stringify(ho)).not.toContain("cargo-tail");
+  rdb.close();
+});
+
+test("short bodies survive a kickoff preview verbatim (minus nothing)", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "big", type: "note", title: "SHORT", body: "small body", surface: "s" });
+  const state = readProjectState(rdb, "big");
+  expect(state.recent_concepts[0]!.body_preview).toBe("small body");
+  rdb.close();
 });
 
 // --- Engine-enforced invariants: the SQLite substrate itself rejects tampering, not just the tools ---

@@ -73,14 +73,17 @@ export interface ReturnHandoffArgs {
   return_note: string;
 }
 
+/** A concept as the kickoff presents it: the row minus `body`, plus a bounded `body_preview`. */
+export type ConceptSummary = Omit<ConceptRow, "body"> & { body_preview: string };
+
 export interface ProjectState {
   project: string;
   exists: boolean;
   name: string;
-  concepts_by_status: Record<ConceptStatus, ConceptRow[]>;
+  concepts_by_status: Record<ConceptStatus, ConceptSummary[]>;
   open_handoffs: Array<Record<string, unknown>>;
   recent_handoffs: Array<Record<string, unknown>>;
-  recent_concepts: ConceptRow[];
+  recent_concepts: ConceptSummary[];
 }
 
 // --- Internal helpers -------------------------------------------------------
@@ -122,6 +125,29 @@ function presentHandoff(row: HandoffRow): Record<string, unknown> {
     snapshot = row.payload_snapshot;
   }
   return { ...row, payload_snapshot: snapshot };
+}
+
+// The kickoff is a MAP of the project, not the archive: a mature pool's full bodies overflow a
+// client's context budget, so read_project_state ships bounded previews and read_concept(id)
+// remains the full-recall path. Presentation only — stored rows and frozen snapshots are untouched.
+const PREVIEW_CHARS = 280;
+
+function summarize(c: ConceptRow): ConceptSummary {
+  const { body, ...rest } = c;
+  const flat = body.replace(/\s+/g, " ").trim();
+  return { ...rest, body_preview: flat.length > PREVIEW_CHARS ? flat.slice(0, PREVIEW_CHARS) + "…" : flat };
+}
+
+/** presentHandoff for the kickoff: snapshot concepts carry previews; directive/return_note stay whole. */
+function presentHandoffPreview(row: HandoffRow): Record<string, unknown> {
+  const presented = presentHandoff(row);
+  const snap = presented.payload_snapshot;
+  if (Array.isArray(snap)) {
+    presented.payload_snapshot = snap.map((c) =>
+      c && typeof c === "object" && typeof (c as ConceptRow).body === "string" ? summarize(c as ConceptRow) : c,
+    );
+  }
+  return presented;
 }
 
 // --- The six operations -----------------------------------------------------
@@ -190,14 +216,14 @@ export function readProjectState(db: Database, project: string): ProjectState {
   const concepts = db
     .query<ConceptRow, [string]>(`SELECT * FROM concept WHERE project_id = ? ORDER BY created_at ASC`)
     .all(projectId);
-  const byStatus: Record<ConceptStatus, ConceptRow[]> = {
+  const byStatus: Record<ConceptStatus, ConceptSummary[]> = {
     active: [],
     locked: [],
     parked: [],
     resolved: [],
     discarded: [],
   };
-  for (const c of concepts) byStatus[c.status].push(c);
+  for (const c of concepts) byStatus[c.status].push(summarize(c));
 
   const openHandoffs = db
     .query<HandoffRow, [string]>(
@@ -220,9 +246,9 @@ export function readProjectState(db: Database, project: string): ProjectState {
     exists: projectRow !== null,
     name: projectRow?.name ?? project,
     concepts_by_status: byStatus,
-    open_handoffs: openHandoffs.map(presentHandoff),
-    recent_handoffs: recentHandoffs.map(presentHandoff),
-    recent_concepts: recentConcepts,
+    open_handoffs: openHandoffs.map(presentHandoffPreview),
+    recent_handoffs: recentHandoffs.map(presentHandoffPreview),
+    recent_concepts: recentConcepts.map(summarize),
   };
 }
 
@@ -372,7 +398,8 @@ export function registerTools(server: McpServer, db: Database): void {
       title: "Read project state",
       description:
         "Session-kickoff context for a project: concepts grouped by status, open (pending) handoffs, " +
-        "and recent handoffs and concepts.",
+        "and recent handoffs and concepts. Concept bodies arrive as bounded previews (body_preview) — " +
+        "call read_concept(id) for any full body you need.",
       inputSchema: {
         project: z.string().describe("Project id or name."),
       },
@@ -441,12 +468,12 @@ export function registerTools(server: McpServer, db: Database): void {
  */
 export const SERVER_INSTRUCTIONS = [
   "headwater records how state MOVES between AI surfaces (chats, code sessions, agents) — the handoff, not just the memory.",
-  "KICKOFF: before substantive work call read_project_state(<project>) to load prior decisions, open questions, and pending handoffs. Pin <project> per surface; never infer it from a directory name.",
+  "KICKOFF: before substantive work call read_project_state(<project>) to load prior decisions, open questions, and pending handoffs. Bodies arrive as bounded previews — read_concept(id) recalls any full text. Pin <project> per surface; never infer it from a directory name.",
   "CAPTURE: as durable decisions emerge call write_concept — ONLY things worth remembering across sessions (decision, architecture, constraint, open_question), never routine chatter or anything already in code/git. Short imperative title; the body states the decision AND the why. Identify yourself with a stable surface label like 'claude-code:<repo>' or 'claude-desktop:<project>'.",
-  "RICH BODIES: a concept body renders a markdown subset (headings, bold/italic/inline code, http links + images, pipe tables) plus mermaid diagram blocks in the viewer — use them so a concept can express itself, not just plain prose.",
-  "REVISE BY FORKING: concepts are immutable — never rewrite one. fork_concept off the parent (kind supersedes / evolved_from / annotates) so history stays a linked tree.",
+  "RICH BODIES: a concept body renders a markdown subset (headings, bold/italic/inline code, http links + images, pipe tables, bullet/numbered lists, '- [ ]'/'- [x]' checklists) plus mermaid diagram blocks in the viewer — use them so a concept can express itself, not just plain prose. Cite related concepts and handoffs as [[concept-id]] (the hash suffix is optional): resolved ids render as links, dangling ones as ghosts that flag the missing node.",
+  "REVISE BY FORKING: concepts are immutable — never rewrite one. fork_concept off the parent (kind supersedes / evolved_from / annotates) so history stays a linked tree. A maintained list (a task registry) is a concept kept current by supersede-forks, not an edit.",
   "HAND OFF: open_handoff(concept_ids + directive) passes work to another surface; return_handoff(note) closes the loop. The payload snapshot is frozen at creation.",
-  "OBSERVE: run 'bun run serve' for a local read-and-write viewer at 127.0.0.1 where the operator can browse, filter, and comment/fork/hand off from the page.",
+  "OBSERVE: run 'bun run serve' for a local read-and-write viewer at 127.0.0.1 where the operator can browse, filter, inspect each handoff's frozen-vs-current evidence, and comment/fork/hand off from the page.",
   'Full playbook: read the concept titled "How to use headwater effectively" (surfaced by read_project_state).',
 ].join("\n\n");
 
