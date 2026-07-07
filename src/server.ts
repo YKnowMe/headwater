@@ -74,7 +74,10 @@ export interface ReturnHandoffArgs {
 }
 
 /** A concept as the kickoff presents it: the row minus `body`, plus a bounded `body_preview`. */
-export type ConceptSummary = Omit<ConceptRow, "body"> & { body_preview: string };
+export type ConceptSummary = Omit<ConceptRow, "body"> & { body_preview: string; closed_by?: ClosedBy };
+
+/** How a concept was derived-closed: the closing fork's id and which rule fired. */
+export type ClosedBy = { concept_id: string; via: "supersedes" | "decision" };
 
 export interface ProjectState {
   project: string;
@@ -136,6 +139,38 @@ function summarize(c: ConceptRow): ConceptSummary {
   const { body, ...rest } = c;
   const flat = body.replace(/\s+/g, " ").trim();
   return { ...rest, body_preview: flat.length > PREVIEW_CHARS ? flat.slice(0, PREVIEW_CHARS) + "…" : flat };
+}
+
+// Closing edge kinds for the open_question-answered-by-decision rule. annotates (a comment),
+// relates_to, and depends_on never close anything.
+const CLOSING_KINDS: ReadonlySet<string> = new Set(["forks_from", "evolved_from", "supersedes"]);
+
+/**
+ * Derived closure (see pool decision "Closure is derived from lineage, never stored"): concepts
+ * reject every UPDATE, so `resolved` is unreachable as a stored transition — closure is computed
+ * from lineage instead. A `supersedes` child closes any concept; a `decision` child (via a closing
+ * kind) closes an `open_question`. Earliest closing fork wins. Presentation only — stored rows
+ * keep their status.
+ */
+export function computeClosures(db: Database): Map<string, ClosedBy> {
+  const rows = db
+    .query<{ child: string; parent: string; kind: string; child_type: string; parent_type: string }, []>(
+      `SELECT l.from_concept_id AS child, l.to_concept_id AS parent, l.kind,
+              cc.type AS child_type, cp.type AS parent_type
+         FROM lineage l
+         JOIN concept cc ON cc.id = l.from_concept_id
+         JOIN concept cp ON cp.id = l.to_concept_id
+        ORDER BY l.created_at ASC`,
+    )
+    .all();
+  const closures = new Map<string, ClosedBy>();
+  for (const r of rows) {
+    if (closures.has(r.parent)) continue; // earliest closing fork wins
+    if (r.kind === "supersedes") closures.set(r.parent, { concept_id: r.child, via: "supersedes" });
+    else if (r.parent_type === "open_question" && r.child_type === "decision" && CLOSING_KINDS.has(r.kind))
+      closures.set(r.parent, { concept_id: r.child, via: "decision" });
+  }
+  return closures;
 }
 
 /** presentHandoff for the kickoff: snapshot concepts carry previews; directive/return_note stay whole. */
@@ -216,6 +251,9 @@ export function readProjectState(db: Database, project: string): ProjectState {
   const concepts = db
     .query<ConceptRow, [string]>(`SELECT * FROM concept WHERE project_id = ? ORDER BY created_at ASC`)
     .all(projectId);
+  // Bucket by EFFECTIVE status: a derived-closed concept moves out of active/locked/parked into
+  // resolved (its summary keeps the stored status + closed_by, so the derivation stays visible).
+  const closures = computeClosures(db);
   const byStatus: Record<ConceptStatus, ConceptSummary[]> = {
     active: [],
     locked: [],
@@ -223,7 +261,13 @@ export function readProjectState(db: Database, project: string): ProjectState {
     resolved: [],
     discarded: [],
   };
-  for (const c of concepts) byStatus[c.status].push(summarize(c));
+  for (const c of concepts) {
+    const s = summarize(c);
+    const cb = closures.get(c.id);
+    if (cb) s.closed_by = cb;
+    const bucket: ConceptStatus = cb && c.status !== "discarded" && c.status !== "resolved" ? "resolved" : c.status;
+    byStatus[bucket].push(s);
+  }
 
   const openHandoffs = db
     .query<HandoffRow, [string]>(
@@ -248,7 +292,12 @@ export function readProjectState(db: Database, project: string): ProjectState {
     concepts_by_status: byStatus,
     open_handoffs: openHandoffs.map(presentHandoffPreview),
     recent_handoffs: recentHandoffs.map(presentHandoffPreview),
-    recent_concepts: recentConcepts.map(summarize),
+    recent_concepts: recentConcepts.map((c) => {
+      const s = summarize(c);
+      const cb = closures.get(c.id);
+      if (cb) s.closed_by = cb;
+      return s;
+    }),
   };
 }
 
@@ -471,7 +520,7 @@ export const SERVER_INSTRUCTIONS = [
   "KICKOFF: before substantive work call read_project_state(<project>) to load prior decisions, open questions, and pending handoffs. Bodies arrive as bounded previews — read_concept(id) recalls any full text. Pin <project> per surface; never infer it from a directory name.",
   "CAPTURE: as durable decisions emerge call write_concept — ONLY things worth remembering across sessions (decision, architecture, constraint, open_question), never routine chatter or anything already in code/git. Short imperative title; the body states the decision AND the why. Identify yourself with a stable surface label like 'claude-code:<repo>' or 'claude-desktop:<project>'.",
   "RICH BODIES: a concept body renders a markdown subset (headings, bold/italic/inline code, http links + images, pipe tables, bullet/numbered lists, '- [ ]'/'- [x]' checklists) plus mermaid diagram blocks in the viewer — use them so a concept can express itself, not just plain prose. Cite related concepts and handoffs as [[concept-id]] (the hash suffix is optional): resolved ids render as links, dangling ones as ghosts that flag the missing node.",
-  "REVISE BY FORKING: concepts are immutable — never rewrite one. fork_concept off the parent (kind supersedes / evolved_from / annotates) so history stays a linked tree. A maintained list (a task registry) is a concept kept current by supersede-forks, not an edit.",
+  "REVISE BY FORKING: concepts are immutable — never rewrite one. fork_concept off the parent (kind supersedes / evolved_from / annotates) so history stays a linked tree. A maintained list (a task registry) is a concept kept current by supersede-forks, not an edit. CLOSURE IS DERIVED, never stored: a supersedes fork closes its parent, and a decision fork answers an open_question — kickoff and viewer then present the parent as resolved (closed_by names the fork). There is no status-update path; do not look for one.",
   "HAND OFF: open_handoff(concept_ids + directive) passes work to another surface; return_handoff(note) closes the loop. The payload snapshot is frozen at creation.",
   "OBSERVE: run 'bun run serve' for a local read-and-write viewer at 127.0.0.1 where the operator can browse, filter, inspect each handoff's frozen-vs-current evidence, and comment/fork/hand off from the page.",
   'Full playbook: read the concept titled "How to use headwater effectively" (surfaced by read_project_state).',

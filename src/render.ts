@@ -20,7 +20,8 @@ import type { ConceptRow, HandoffRow, LineageRow } from "./db.ts";
 // The live viewer's write surface calls the SAME tool-logic functions the MCP tools use (no new write
 // path, so every invariant — immutability, append-only lineage, frozen snapshots — holds). server.ts
 // imports only ./db.ts, so this stays a clean render -> server -> db DAG (no cycle).
-import { forkConcept, openHandoff, returnHandoff } from "./server.ts";
+import { forkConcept, openHandoff, returnHandoff, computeClosures } from "./server.ts";
+import type { ClosedBy } from "./server.ts";
 
 type ConceptView = ConceptRow & { origin_label: string; project_name: string };
 type LineageView = LineageRow & { child_title: string; parent_title: string };
@@ -89,6 +90,8 @@ type PoolCtx = {
   current: Map<string, CurrentConcept>;
   /** Lineage edges pointing AT a concept (its forks), for "diverged — N forks since handoff". */
   forksTo: Map<string, Array<{ from: string; at: string }>>;
+  /** Derived closure per concept (see the pool decision) — drives effective grouping + the badge. */
+  closures: Map<string, ClosedBy>;
 };
 
 function buildPoolCtx(db: Database): PoolCtx {
@@ -113,7 +116,12 @@ function buildPoolCtx(db: Database): PoolCtx {
     if (current.has(slug) || handoffIds.has(slug)) return slug;
     return ids.find((id) => id.startsWith(slug + "-")) ?? null;
   };
-  return { resolve, current, forksTo };
+  return { resolve, current, forksTo, closures: computeClosures(db) };
+}
+
+/** Effective status: derived closure moves a still-open stored status into `resolved`. */
+function effectiveStatus(c: ConceptView, ctx: PoolCtx): string {
+  return ctx.closures.has(c.id) && c.status !== "discarded" && c.status !== "resolved" ? "resolved" : c.status;
 }
 
 /** Inline formatting on one line. Escapes first; nothing below can introduce a raw `<` or `"`. */
@@ -322,15 +330,21 @@ function renderCardActions(c: ConceptView): string {
     </details>`;
 }
 
-function renderConceptCard(c: ConceptView, live: boolean, resolve?: WikiResolve): string {
+function renderConceptCard(c: ConceptView, live: boolean, ctx: PoolCtx): string {
+  // Derived closure: badge the closing fork so "why is this under resolved?" answers itself.
+  const cb = ctx.closures.get(c.id);
+  const closedBy = cb
+    ? `<span class="closed-by">${cb.via === "supersedes" ? "superseded" : "resolved"} by <a class="wl" href="#${esc(cb.concept_id)}"><code class="id">${esc(cb.concept_id)}</code></a></span>`
+    : "";
   // The card's id is the concept id — the anchor every resolved [[wikilink]] points at.
   return `
     <article class="card" id="${esc(c.id)}">
       <div class="card-head">
         ${badge(c.type, "type")}
         <h3 class="card-title">${esc(c.title)}</h3>
+        ${closedBy}
       </div>
-      ${renderBody(c.body, live, resolve)}
+      ${renderBody(c.body, live, ctx.resolve)}
       <div class="meta">
         <code class="id">${esc(c.id)}</code>
         <span>origin: ${esc(c.origin_label)}</span>
@@ -345,34 +359,35 @@ function renderConceptCard(c: ConceptView, live: boolean, resolve?: WikiResolve)
 // more" disclosure so a 200-concept group can't blow out the page (every card stays one click away).
 const CARD_CAP = 12;
 
-function renderCards(items: ConceptView[], live: boolean, resolve?: WikiResolve): string {
-  const cards = items.map((c) => renderConceptCard(c, live, resolve));
+function renderCards(items: ConceptView[], live: boolean, ctx: PoolCtx): string {
+  const cards = items.map((c) => renderConceptCard(c, live, ctx));
   if (cards.length <= CARD_CAP) return `<div class="cards">${cards.join("")}</div>`;
   const head = cards.slice(0, CARD_CAP).join("");
   const rest = cards.slice(CARD_CAP).join("");
   return `<div class="cards">${head}</div><details class="more"><summary>Show ${cards.length - CARD_CAP} more</summary><div class="cards">${rest}</div></details>`;
 }
 
-function renderConceptsSection(concepts: ConceptView[], live: boolean, resolve?: WikiResolve): string {
+function renderConceptsSection(concepts: ConceptView[], live: boolean, ctx: PoolCtx): string {
   if (concepts.length === 0) {
     return `<section><h2>Concepts</h2><p class="empty">No concepts yet.</p></section>`;
   }
+  // Grouped by EFFECTIVE status: derived-closed concepts sit under resolved, badged with their closer.
   const groups = CONCEPT_STATUSES.map((status) => {
-    const items = concepts.filter((c) => c.status === status);
+    const items = concepts.filter((c) => effectiveStatus(c, ctx) === status);
     if (items.length === 0) return "";
     return `
       <div class="status-group">
         <h3 class="status-head">${badge(status, `st-${status}`)} <span class="count">${items.length}</span></h3>
-        ${renderCards(items, live, resolve)}
+        ${renderCards(items, live, ctx)}
       </div>`;
   }).join("");
   return `<section><h2>Concepts <span class="count">${concepts.length}</span></h2>${groups}</section>`;
 }
 
-/** Sticky toolbar content: pool scale + per-status tallies, so the reader gets shape at a glance. */
-function renderOverview(concepts: ConceptView[], projectCount: number, lineageCount: number, handoffCount: number): string {
+/** Sticky toolbar content: pool scale + per-status tallies (effective status, matching the groups). */
+function renderOverview(concepts: ConceptView[], projectCount: number, lineageCount: number, handoffCount: number, ctx: PoolCtx): string {
   const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
-  const tallies = CONCEPT_STATUSES.map((s) => [s, concepts.filter((c) => c.status === s).length] as const)
+  const tallies = CONCEPT_STATUSES.map((s) => [s, concepts.filter((c) => effectiveStatus(c, ctx) === s).length] as const)
     .filter(([, n]) => n > 0)
     .map(([s, n]) => `${badge(s, `st-${s}`)} <span class="count">${n}</span>`)
     .join(" ");
@@ -655,7 +670,7 @@ function renderProjectSection(p: ProjectBucket, opts: { live?: boolean }, open: 
   return `
     <details class="project" id="proj-${esc(p.id)}"${open ? " open" : ""}>
       <summary><span class="proj-name">${esc(p.name)}</span> <span class="count">${counts}</span>${focus}</summary>
-      ${renderConceptsSection(p.concepts, !!opts.live, ctx.resolve)}
+      ${renderConceptsSection(p.concepts, !!opts.live, ctx)}
       ${renderMatrix(p.concepts)}
       ${renderLineageSection(p.edges, p.handoffs, ctx)}
       ${renderHandoffsSection(p.handoffs, !!opts.live, ctx)}
@@ -764,7 +779,8 @@ const STYLE = `
   .status-head { font-size: 14px; margin: 0 0 10px; font-weight: 600; }
   .cards { display: grid; gap: 12px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
-  .card-head { display: flex; align-items: baseline; gap: 10px; }
+  .card-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .closed-by { font-size: 12.5px; color: var(--returned); margin-left: auto; }
   .card-title { margin: 0; font-size: 16px; }
   .card-body { margin: 8px 0 10px; color: #333a48; white-space: pre-wrap; }
   .meta { display: flex; flex-wrap: wrap; gap: 14px; color: var(--muted); font-size: 12.5px; align-items: center; }
@@ -1016,16 +1032,16 @@ export function renderHtml(db: Database, opts: ViewOpts = {}): string {
 
   // Group by project so the shared pool's projects never commingle. The static render shows every
   // project; the live viewer can scope to one via ?project= (opts.only), with a switcher to the rest.
+  const ctx = buildPoolCtx(db);
   const projects = groupByProject(concepts, lineage, handoffs);
   const shown = opts.only ? projects.filter((p) => p.id === opts.only) : projects;
   const projectIndex = renderProjectIndex(projects, opts);
   const filterBar = opts.live ? renderFilterBar(db, opts) : "";
-  const overview = renderOverview(concepts, projects.length, lineage.length, handoffs.length);
+  const overview = renderOverview(concepts, projects.length, lineage.length, handoffs.length, ctx);
   const schemaPanel = renderSchemaPanel(tableCounts(db));
   // Small pools stay open and scannable; large ones collapse to an index of project headers. A
   // project scoped via ?project= is always open.
   const isOpen = (p: ProjectBucket) => projects.length <= 3 || opts.only === p.id;
-  const ctx = buildPoolCtx(db);
   const sections =
     shown.length > 0
       ? shown.map((p) => renderProjectSection(p, opts, isOpen(p), ctx)).join("")

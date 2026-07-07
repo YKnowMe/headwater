@@ -76,7 +76,11 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
 - `read_project_state(project)` → kickoff context: concepts grouped by status, pending handoffs, recents.
   Bodies arrive as bounded `body_preview`s (the kickoff is a map, not the archive); `read_concept` recalls
   the full text — this applies to frozen snapshot concepts inside handoffs too (presentation only; stored
-  rows and snapshots stay whole).
+  rows and snapshots stay whole). Grouping is by **effective** status: closure is **derived from lineage,
+  never stored** (a `supersedes` child closes any concept; a `decision` child via forks_from/evolved_from/
+  supersedes answers an `open_question`; annotates/relates_to/depends_on never close) — a derived-closed
+  concept presents under `resolved` with `closed_by`, its stored status untouched. The viewer groups and
+  badges the same way. Do not add a status-update path; this is the settled alternative.
 - `open_handoff(project, from_surface, to_surface, concept_ids, directive)` → `pending` handoff with a
   frozen JSON `payload_snapshot` of the named concepts + `handoff_concept` join rows.
 - `return_handoff(handoff_id, return_note)` → `status=returned`, `returned_at=now`, `return_note`.

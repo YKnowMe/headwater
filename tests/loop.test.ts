@@ -418,6 +418,65 @@ test("a wikilink naming a handoff id resolves to the handoff's anchored entry", 
   rdb.close();
 });
 
+// --- Derived closure: lineage closes a concept; status is never mutated (decision 0cc10bf3) ---------
+// Concepts reject every UPDATE, so `resolved` is unreachable as a stored transition. Closure is
+// DERIVED: a supersedes child closes any concept; a decision child (forks_from/evolved_from/
+// supersedes) closes an open_question. annotates/relates_to/depends_on never close. Presentation
+// only — the stored row keeps its status; kickoff + viewer re-bucket by effective status.
+
+test("an answered open_question presents as resolved, carrying closed_by -> the answering fork", () => {
+  const rdb = initDb(":memory:");
+  const q = writeConcept(rdb, { project: "p", type: "open_question", title: "Which db?", body: "?", surface: "s" });
+  const a = forkConcept(rdb, { parent_id: q.id, body: "sqlite, because local-first", surface: "s", type: "decision", title: "Use sqlite" });
+  const state = readProjectState(rdb, "p");
+  const resolvedIds = state.concepts_by_status.resolved.map((c) => c.id);
+  expect(resolvedIds).toContain(q.id);
+  expect(state.concepts_by_status.active.map((c) => c.id)).not.toContain(q.id);
+  const closed = state.concepts_by_status.resolved.find((c) => c.id === q.id)!;
+  expect(closed.closed_by).toEqual({ concept_id: a.id, via: "decision" });
+  expect(closed.status).toBe("active"); // the stored row is untouched — the derivation stays visible
+  rdb.close();
+});
+
+test("a supersedes fork closes any concept type; the earliest closing fork wins", () => {
+  const rdb = initDb(":memory:");
+  const c = writeConcept(rdb, { project: "p", type: "note", title: "Old registry", body: "rev 1", surface: "s" });
+  const rev2 = forkConcept(rdb, { parent_id: c.id, body: "rev 2", surface: "s", kind: "supersedes" });
+  forkConcept(rdb, { parent_id: c.id, body: "rev 3 (also supersedes, later)", surface: "s", kind: "supersedes" });
+  const state = readProjectState(rdb, "p");
+  const closed = state.concepts_by_status.resolved.find((x) => x.id === c.id)!;
+  expect(closed.closed_by).toEqual({ concept_id: rev2.id, via: "supersedes" });
+  rdb.close();
+});
+
+test("comments and soft edges never close: annotates on anything, decision via relates_to", () => {
+  const rdb = initDb(":memory:");
+  const q = writeConcept(rdb, { project: "p", type: "open_question", title: "Open?", body: "?", surface: "s" });
+  forkConcept(rdb, { parent_id: q.id, body: "just a comment", surface: "s", kind: "annotates", type: "decision" });
+  forkConcept(rdb, { parent_id: q.id, body: "related decision", surface: "s", kind: "relates_to", type: "decision" });
+  const n = writeConcept(rdb, { project: "p", type: "note", title: "Note", body: "n", surface: "s" });
+  forkConcept(rdb, { parent_id: n.id, body: "a mere fork", surface: "s", kind: "forks_from", type: "decision" });
+  const state = readProjectState(rdb, "p");
+  const activeIds = state.concepts_by_status.active.map((c) => c.id);
+  expect(activeIds).toContain(q.id); // open_question stays open
+  expect(activeIds).toContain(n.id); // a note is not answerable — only supersedes closes it
+  expect(state.concepts_by_status.resolved).toHaveLength(0);
+  rdb.close();
+});
+
+test("the viewer groups a derived-closed concept under resolved and badges the closing fork", () => {
+  const rdb = initDb(":memory:");
+  const q = writeConcept(rdb, { project: "p", type: "open_question", title: "VIEWER_QUESTION", body: "?", surface: "s" });
+  const a = forkConcept(rdb, { parent_id: q.id, body: "answer", surface: "s", type: "decision", title: "VIEWER_ANSWER" });
+  const html = renderHtml(rdb);
+  // the question's card sits inside the resolved status group, not active
+  const resolvedGroup = html.slice(html.indexOf("st-resolved"));
+  expect(resolvedGroup).toContain("VIEWER_QUESTION");
+  // and carries a closed-by annotation linking to the closing fork
+  expect(html).toMatch(new RegExp(`class="closed-by">resolved by <a class="wl" href="#${a.id}"`));
+  rdb.close();
+});
+
 // --- db.ts: the shared pool must survive concurrent opens by multiple server processes ---
 
 test("initDb sets a busy_timeout so concurrent processes wait for the lock instead of crashing", () => {
