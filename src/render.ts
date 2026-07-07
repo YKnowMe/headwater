@@ -76,16 +76,44 @@ function clip(s: string, n: number): string {
  */
 type WikiResolve = (slug: string) => string | null;
 
-function buildWikiResolver(db: Database): WikiResolve {
-  // Resolution is always against the WHOLE pool (not the current filter), so a scoped live view
-  // never turns a real reference into a ghost.
-  const conceptIds = db.query<{ id: string }, []>(`SELECT id FROM concept ORDER BY created_at ASC`).all().map((r) => r.id);
+type CurrentConcept = { id: string; title: string; status: string; body: string; created_at: string };
+
+/**
+ * Whole-pool context for cross-cutting rendering: wikilink resolution, the frozen-vs-current
+ * comparison, and the drift verdict. Always built from the WHOLE pool (never the current live
+ * filter), so a scoped view can neither fake a ghost nor hide real drift.
+ */
+type PoolCtx = {
+  resolve: WikiResolve;
+  /** Every concept's current row — the "current — in pool now" side of a carried-concept pane. */
+  current: Map<string, CurrentConcept>;
+  /** Lineage edges pointing AT a concept (its forks), for "diverged — N forks since handoff". */
+  forksTo: Map<string, Array<{ from: string; at: string }>>;
+};
+
+function buildPoolCtx(db: Database): PoolCtx {
+  const rows = db
+    .query<CurrentConcept, []>(`SELECT id, title, status, body, created_at FROM concept ORDER BY created_at ASC`)
+    .all();
+  const current = new Map(rows.map((r) => [r.id, r] as const));
+  const ids = rows.map((r) => r.id);
   const handoffIds = new Set(db.query<{ id: string }, []>(`SELECT id FROM handoff`).all().map((r) => r.id));
-  const exact = new Set(conceptIds);
-  return (slug) => {
-    if (exact.has(slug) || handoffIds.has(slug)) return slug;
-    return conceptIds.find((id) => id.startsWith(slug + "-")) ?? null;
+  const forksTo = new Map<string, Array<{ from: string; at: string }>>();
+  const edges = db
+    .query<{ from_concept_id: string; to_concept_id: string; created_at: string }, []>(
+      `SELECT from_concept_id, to_concept_id, created_at FROM lineage ORDER BY created_at ASC`,
+    )
+    .all();
+  for (const e of edges) {
+    const list = forksTo.get(e.to_concept_id) ?? [];
+    list.push({ from: e.from_concept_id, at: e.created_at });
+    forksTo.set(e.to_concept_id, list);
+  }
+  const resolve: WikiResolve = (slug) => {
+    if (current.has(slug) || handoffIds.has(slug)) return slug;
+    return ids.find((id) => id.startsWith(slug + "-")) ?? null;
   };
+  return { resolve, current, forksTo };
 }
 
 /** Inline formatting on one line. Escapes first; nothing below can introduce a raw `<` or `"`. */
@@ -354,10 +382,14 @@ function renderOverview(concepts: ConceptView[], projectCount: number, lineageCo
     </div>`;
 }
 
-function renderLineageSection(edges: LineageView[], key: string): string {
-  if (edges.length === 0) {
-    return `<section><h2>Lineage</h2><p class="empty">No lineage edges yet.</p></section>`;
-  }
+/**
+ * The ONE canonical lineage tree (diagram/table representations pruned — the settled Design pass).
+ * A fork edge needs no reveal: its whole evidence (kind + reason badges) fits inline on the branch
+ * row. Open loops get the ghost grammar: a pending handoff hangs a `carried by` edge plus a dashed
+ * "expected return concept" branch off each carried concept, and a root whose body cites a concept
+ * the pool doesn't have grows a dashed "dangling link" branch.
+ */
+function renderLineageSection(edges: LineageView[], handoffs: HandoffView[], ctx: PoolCtx): string {
   // Group edges by parent (to_concept_id): the original is the canonical root, branches hang off it.
   const parents = new Map<string, { title: string; branches: LineageView[] }>();
   for (const e of edges) {
@@ -365,41 +397,130 @@ function renderLineageSection(edges: LineageView[], key: string): string {
     entry.branches.push(e);
     parents.set(e.to_concept_id, entry);
   }
+  // A pending handoff's carried concepts join the forest even with no forks yet — the open loop
+  // must have a visible shape (decision 4).
+  const pendingBy = new Map<string, HandoffView[]>();
+  for (const h of handoffs) {
+    if (h.status !== "pending") continue;
+    for (const f of parseSnapshot(h.payload_snapshot)) {
+      if (!parents.has(f.id)) parents.set(f.id, { title: ctx.current.get(f.id)?.title ?? f.title, branches: [] });
+      const list = pendingBy.get(f.id) ?? [];
+      list.push(h);
+      pendingBy.set(f.id, list);
+    }
+  }
+  if (parents.size === 0) {
+    return `<section><h2>Lineage</h2><p class="empty">No lineage edges yet.</p></section>`;
+  }
   const trees = [...parents.entries()]
     .map(([parentId, { title, branches }]) => {
-      const rows = branches
-        .map(
-          (b) => `
+      const rows = branches.map(
+        (b) => `
           <li class="branch">
             <span class="branch-edge">${badge(b.kind, "edge")}${
               b.reason ? badge(b.reason, "reason") : ""
             }</span>
             <span class="branch-node">${esc(b.child_title)} <code class="id">${esc(b.from_concept_id)}</code></span>
           </li>`,
-        )
-        .join("");
+      );
+      for (const h of pendingBy.get(parentId) ?? []) {
+        rows.push(`
+          <li class="branch ho-edge">
+            ${badge(`handoff · ${h.status}`, `ho-${h.status}`)}
+            <span class="branch-node">carried by</span> <code class="id">${esc(h.id)}</code>
+            <span class="annot">&rarr; ${esc(h.to_label)}</span>
+          </li>`);
+        rows.push(`
+          <li class="branch ghost-branch">
+            ${badge("expected", "ghost-badge")}
+            <span class="ghost-node">return concept from <code>${esc(h.to_label)}</code> — not yet in pool</span>
+          </li>`);
+      }
+      const rootBody = ctx.current.get(parentId)?.body ?? "";
+      const seen = new Set<string>();
+      for (const m of rootBody.matchAll(/\[\[([A-Za-z0-9][A-Za-z0-9_-]*)\]\]/g)) {
+        const slug = m[1]!;
+        if (seen.has(slug) || ctx.resolve(slug)) continue;
+        seen.add(slug);
+        rows.push(`
+          <li class="branch ghost-branch">
+            ${badge("dangling link", "ghost-badge")}
+            <span class="ghost-node">body references <code>[[${esc(slug)}]]</code> — no such concept in the pool</span>
+          </li>`);
+      }
       return `
         <div class="tree">
           <div class="tree-root">${esc(title)} <code class="id">${esc(parentId)}</code></div>
-          <ul class="branches">${rows}</ul>
+          <ul class="branches">${rows.join("")}</ul>
         </div>`;
     })
     .join("");
-  // Exclusive switch: tree (as-is) | diagram | table — same lineage, one representation at a time.
-  const g = `lin-${esc(key)}`;
-  const views =
-    `<details class="view" name="${g}" open><summary>Tree</summary>${trees}</details>` +
-    `<details class="view" name="${g}"><summary>Diagram</summary>${buildLineageSvg(parents)}</details>` +
-    `<details class="view" name="${g}"><summary>Table</summary>${renderLineageTable(edges)}</details>`;
-  return `<section><h2>Lineage <span class="count">${edges.length}</span></h2><div class="switch">${views}</div></section>`;
+  return `<section><h2>Lineage <span class="count">${edges.length}</span></h2>${trees}</section>`;
 }
 
-function renderHandoffCard(h: HandoffView, live: boolean): string {
-  const carried = carriedCount(h.payload_snapshot);
+type FrozenConcept = { id: string; title: string; status: string; body: string; created_at: string };
+
+/** The frozen payload of a handoff — parsed defensively; malformed JSON renders as "carries 0". */
+function parseSnapshot(payload: string): FrozenConcept[] {
+  try {
+    const parsed = JSON.parse(payload);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * One carried concept inside a handoff's evidence: frozen pane (as handed off) beside the current
+ * pane (in pool now), then a one-line drift verdict. Concepts are immutable, so divergence is
+ * status transitions and forks since the handoff — both computable from the pool with plain SELECTs.
+ */
+function renderCarry(frozen: FrozenConcept, h: HandoffView, ctx: PoolCtx): string {
+  const cur = ctx.current.get(frozen.id);
+  const paneText = (b: string) => esc(clip(flatPreview(b), 240));
+  const currentPane = cur
+    ? `<div class="pane current"><div class="pane-h"><span>current — in pool now</span>${badge(cur.status, `st-${cur.status}`)}</div><p>${paneText(cur.body)}</p></div>`
+    : `<div class="pane current"><div class="pane-h"><span>current — in pool now</span></div><p>not in the pool</p></div>`;
+  const moved: string[] = [];
+  if (cur && cur.status !== frozen.status) moved.push(`status ${esc(frozen.status)} &rarr; ${esc(cur.status)}`);
+  const forks = (ctx.forksTo.get(frozen.id) ?? []).filter((f) => f.at >= h.initiated_at);
+  if (forks.length > 0) {
+    const ids = forks.map((f) => `<code class="id">${esc(f.from)}</code>`).join(" ");
+    moved.push(`${forks.length} fork${forks.length === 1 ? "" : "s"} since handoff: ${ids}`);
+  }
+  const drift = moved.length
+    ? `<span class="drift moved">diverged — ${moved.join("; ")}</span>`
+    : `<span class="drift same">unchanged since handoff</span>`;
+  return `
+        <div class="carry">
+          <p class="carry-title">${esc(frozen.title)} <code class="id">${esc(frozen.id)}</code></p>
+          <div class="compare">
+            <div class="pane frozen"><div class="pane-h"><span>frozen — as handed off</span><span>${esc(h.initiated_at.slice(0, 10))}</span></div><p>${paneText(frozen.body)}</p></div>
+            ${currentPane}
+          </div>
+          ${drift}
+        </div>`;
+}
+
+/**
+ * One handoff on the canonical spine timeline: opened dot -> status-colored spine -> terminus
+ * (returned dot, or the dashed ghost of a surface that hasn't written back). ALL its evidence —
+ * per-carried-concept frozen/current comparison and the return note — lives behind ONE native
+ * <details class="evidence"> (the settled reveal affordance; no pane, no popover, no JS). A pending
+ * handoff's evidence starts open: the open loop is the thing the page exists to make visible.
+ */
+function renderHandoffEntry(h: HandoffView, live: boolean, ctx: PoolCtx): string {
+  const frozen = parseSnapshot(h.payload_snapshot);
+  const n = frozen.length;
+  const pending = h.status === "pending";
+  const carries = frozen.map((f) => renderCarry(f, h, ctx)).join("");
+  const closing = pending
+    ? `<div class="no-return">no return note yet — the loop is open</div>`
+    : `<div class="return-note"><p class="ev-h">return note · ${esc(fmtTime(h.returned_at))}</p>${esc(h.return_note ?? "")}</div>`;
   // Live viewer only: a pending handoff can be closed in place — returnHandoff moves status/return_note
   // while the frozen directive + payload_snapshot stay untouched (the anti-distortion invariant).
   const returnForm =
-    live && h.status === "pending"
+    live && pending
       ? `
         <form class="wform" method="post" action="/w/handoff/return">
           <label>Return <span class="hint">close the loop — what came back?</span></label>
@@ -408,151 +529,39 @@ function renderHandoffCard(h: HandoffView, live: boolean): string {
           <button type="submit">Return handoff</button>
         </form>`
       : "";
+  const terminus = pending
+    ? `<div class="terminus ghost"><span class="who">${esc(h.to_label)}</span> has not written back — awaiting return</div>`
+    : `<div class="terminus ret"><span class="who">${esc(h.to_label)}</span> returned · ${esc(fmtTime(h.returned_at))}</div>`;
   return `
-      <article class="handoff" id="${esc(h.id)}">
-        <div class="handoff-head">
+      <li class="ho is-${esc(h.status)}" id="${esc(h.id)}">
+        <div class="ho-row">
           <span class="route">${esc(h.from_label)} <span class="arrow">&rarr;</span> ${esc(h.to_label)}</span>
           ${badge(h.status, `ho-${h.status}`)}
+          <span class="when">opened ${fmtTime(h.initiated_at)}</span>
         </div>
-        <p class="directive">${esc(h.directive)}</p>
-        <div class="meta">
-          <code class="id">${esc(h.id)}</code>
-          <span>project: ${esc(h.project_name)}</span>
-          <span>carries: ${carried} concept${carried === 1 ? "" : "s"}</span>
-          <span>opened: ${fmtTime(h.initiated_at)}</span>
-          ${h.returned_at ? `<span>returned: ${fmtTime(h.returned_at)}</span>` : ""}
+        <div class="ho-body">
+          <p class="directive">${inline(h.directive, ctx.resolve)}</p>
+          <div class="ho-meta"><code class="id">${esc(h.id)}</code><span>carries ${n} concept${n === 1 ? "" : "s"}</span></div>
+          <details class="evidence"${pending ? " open" : ""}>
+            <summary>evidence — payload, carried concept${n === 1 ? "" : "s"}, ${pending ? "no return yet" : "return note"}</summary>
+            <div class="ev-body">${carries}${closing}</div>
+          </details>
+          ${returnForm}
         </div>
-        ${h.return_note ? `<p class="return-note"><strong>Return note:</strong> ${esc(h.return_note)}</p>` : ""}
-        ${returnForm}
-      </article>`;
+        ${terminus}
+      </li>`;
 }
 
-/**
- * Handoffs as an exclusive switch (cards | table | timeline) — the same data, one representation at a
- * time. Native <details name=...> makes the group mutually exclusive, no client JS. Cards open by default.
- */
-function renderHandoffsSection(handoffs: HandoffView[], key: string, live: boolean): string {
+/** The ONE canonical handoff timeline (cards/table/SVG representations pruned — the settled Design pass). */
+function renderHandoffsSection(handoffs: HandoffView[], live: boolean, ctx: PoolCtx): string {
   if (handoffs.length === 0) {
     return `<section><h2>Handoffs</h2><p class="empty">No handoffs yet.</p></section>`;
   }
-  const g = `ho-${esc(key)}`;
-  const cards = `<div class="timeline">${handoffs.map((h) => renderHandoffCard(h, live)).join("")}</div>`;
-  const svg = buildHandoffTimelineSvg(handoffs);
-  const views =
-    `<details class="view" name="${g}" open><summary>Cards</summary>${cards}</details>` +
-    `<details class="view" name="${g}"><summary>Table</summary>${renderHandoffTable(handoffs)}</details>` +
-    (svg ? `<details class="view" name="${g}"><summary>Timeline</summary>${svg}</details>` : "");
-  return `<section><h2>Handoffs <span class="count">${handoffs.length}</span></h2><div class="switch">${views}</div></section>`;
+  const entries = handoffs.map((h) => renderHandoffEntry(h, live, ctx)).join("");
+  return `<section><h2>Handoffs <span class="count">${handoffs.length}</span></h2><ul class="timeline">${entries}</ul></section>`;
 }
 
-// --- Phase 2: collapsed on-demand views — tables, inline-SVG diagrams, schema panel ----------
-
-function carriedCount(payload: string): number {
-  try {
-    const parsed = JSON.parse(payload);
-    return Array.isArray(parsed) ? parsed.length : 0;
-  } catch {
-    return 0;
-  }
-}
-
-/** Dense handoff table (one representation of the switch). */
-function renderHandoffTable(handoffs: HandoffView[]): string {
-  const rows = handoffs
-    .map(
-      (h) => `<tr>
-        <td>${esc(h.from_label)} &rarr; ${esc(h.to_label)}</td>
-        <td>${badge(h.status, `ho-${h.status}`)}</td>
-        <td class="num">${carriedCount(h.payload_snapshot)}</td>
-        <td>${fmtTime(h.initiated_at)}</td>
-        <td>${fmtTime(h.returned_at)}</td>
-        <td class="clamp2">${esc(h.directive)}</td>
-      </tr>`,
-    )
-    .join("");
-  return `<table class="htbl"><thead><tr><th>route</th><th>status</th><th>carries</th><th>opened</th><th>returned</th><th>directive</th></tr></thead><tbody>${rows}</tbody></table>`;
-}
-
-/** Each handoff as a horizontal lifeline on a shared time axis. Pure inline SVG, no library. */
-function buildHandoffTimelineSvg(handoffs: HandoffView[]): string {
-  const times: number[] = [];
-  for (const h of handoffs) {
-    const a = Date.parse(h.initiated_at);
-    if (Number.isFinite(a)) times.push(a);
-    if (h.returned_at) {
-      const b = Date.parse(h.returned_at);
-      if (Number.isFinite(b)) times.push(b);
-    }
-  }
-  if (times.length === 0) return "";
-  const min = Math.min(...times);
-  let max = Math.max(...times);
-  if (max === min) max = min + 1; // avoid divide-by-zero
-  const W = 720, ROW = 26, PADX = 150, PADR = 24, top = 14;
-  const H = top + handoffs.length * ROW + 12;
-  const x = (t: number) => PADX + ((t - min) / (max - min)) * (W - PADX - PADR);
-  const body = handoffs
-    .map((h, i) => {
-      const y = top + i * ROW + ROW / 2;
-      const a = Date.parse(h.initiated_at);
-      const bRaw = h.returned_at ? Date.parse(h.returned_at) : max;
-      const ax = Number.isFinite(a) ? x(a) : PADX;
-      const bx = Number.isFinite(bRaw) ? x(bRaw) : x(max);
-      const cls = `ho-${h.status}`;
-      const dash = h.status === "pending" ? ` stroke-dasharray="3 3"` : "";
-      const ret = h.returned_at ? `<circle cx="${bx.toFixed(1)}" cy="${y}" r="4" class="tl-ret"/>` : "";
-      return `<text x="8" y="${y + 4}" class="tl-label">${esc(clip(`${h.from_label} → ${h.to_label}`, 22))}</text>
-        <line x1="${ax.toFixed(1)}" y1="${y}" x2="${bx.toFixed(1)}" y2="${y}" class="tl-line ${cls}"${dash}/>
-        <circle cx="${ax.toFixed(1)}" cy="${y}" r="4" class="tl-open"/>${ret}`;
-    })
-    .join("");
-  return `<svg class="timeline-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="handoff timeline">${body}</svg>`;
-}
-
-/** Lineage as a relational companion to the text tree: child -> edge -> parent rows. */
-function renderLineageTable(edges: LineageView[]): string {
-  const rows = edges
-    .map(
-      (e) => `<tr>
-        <td>${esc(e.child_title)} <code class="id">${esc(e.from_concept_id)}</code></td>
-        <td>${badge(e.kind, "edge")}${e.reason ? badge(e.reason, "reason") : ""}</td>
-        <td>${esc(e.parent_title)} <code class="id">${esc(e.to_concept_id)}</code></td>
-        <td>${fmtTime(e.created_at)}</td>
-      </tr>`,
-    )
-    .join("");
-  return `<table class="ltbl"><thead><tr><th>child</th><th>edge</th><th>parent</th><th>when</th></tr></thead><tbody>${rows}</tbody></table>`;
-}
-
-function lineageNode(x: number, y: number, w: number, label: string, isRoot: boolean): string {
-  return (
-    `<rect x="${x}" y="${y}" width="${w}" height="24" rx="6" class="ln-node${isRoot ? " ln-root" : ""}"/>` +
-    `<text x="${x + 8}" y="${y + 16}" class="ln-text">${esc(clip(label, 26))}</text>`
-  );
-}
-
-/** Hand-built SVG of the parent->branches forest: each root box links to its child boxes. No library. */
-function buildLineageSvg(parents: Map<string, { title: string; branches: LineageView[] }>): string {
-  const trees = [...parents.values()];
-  if (trees.length === 0) return "";
-  const W = 720, ROW = 34, NODEW = 200, GAP = 16, x0 = 12, x1 = x0 + NODEW + 60;
-  let y = 12;
-  const parts: string[] = [];
-  for (const t of trees) {
-    const k = Math.max(1, t.branches.length);
-    const rootY = y + ((k - 1) * ROW) / 2;
-    parts.push(lineageNode(x0, rootY, NODEW, t.title, true));
-    t.branches.forEach((b, j) => {
-      const cy = y + j * ROW;
-      parts.push(
-        `<path d="M ${x0 + NODEW} ${rootY + 12} C ${x0 + NODEW + 30} ${rootY + 12}, ${x1 - 30} ${cy + 12}, ${x1} ${cy + 12}" class="ln-edge"/>`,
-      );
-      parts.push(lineageNode(x1, cy, NODEW, b.child_title, false));
-    });
-    y += k * ROW + GAP;
-  }
-  return `<svg class="lineage-svg" viewBox="0 0 ${W} ${y + 8}" role="img" aria-label="lineage tree">${parts.join("")}</svg>`;
-}
+// --- Phase 2 leftovers: the type x status matrix and the schema panel (kept — not representations) --
 
 /** Compact type x status grid: at-a-glance shape of a project's concepts. Collapsed by default. */
 function renderMatrix(concepts: ConceptView[]): string {
@@ -640,16 +649,16 @@ function groupByProject(concepts: ConceptView[], lineage: LineageView[], handoff
 
 /** One project's whole slice: a collapsible section wrapping its concepts, lineage, and handoffs.
  *  `open` is decided by the caller — small pools stay expanded, large ones collapse to a scannable index. */
-function renderProjectSection(p: ProjectBucket, opts: { live?: boolean }, open: boolean, resolve?: WikiResolve): string {
+function renderProjectSection(p: ProjectBucket, opts: { live?: boolean }, open: boolean, ctx: PoolCtx): string {
   const counts = `${p.concepts.length}c · ${p.edges.length}l · ${p.handoffs.length}h`;
   const focus = opts.live ? ` <a class="focus" href="/?project=${encodeURIComponent(p.id)}">focus</a>` : "";
   return `
     <details class="project" id="proj-${esc(p.id)}"${open ? " open" : ""}>
       <summary><span class="proj-name">${esc(p.name)}</span> <span class="count">${counts}</span>${focus}</summary>
-      ${renderConceptsSection(p.concepts, !!opts.live, resolve)}
+      ${renderConceptsSection(p.concepts, !!opts.live, ctx.resolve)}
       ${renderMatrix(p.concepts)}
-      ${renderLineageSection(p.edges, p.id)}
-      ${renderHandoffsSection(p.handoffs, p.id, !!opts.live)}
+      ${renderLineageSection(p.edges, p.handoffs, ctx)}
+      ${renderHandoffsSection(p.handoffs, !!opts.live, ctx)}
     </details>`;
 }
 
@@ -729,6 +738,10 @@ const STYLE = `
   :root {
     --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #6b7385;
     --line: #e4e7ec; --accent: #2f6f6a;
+    --pending: #9a6b16; --pending-bg: #fbf0dc;
+    --returned: #1f7a47; --returned-bg: #e2f3e8;
+    --ghost: #8b93a5;
+    --frozen-bg: #f0f4f8; --frozen-line: #c9d4e0; --frozen-ink: #44506b;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink);
@@ -771,20 +784,88 @@ const STYLE = `
   .ho-returned { background: #e2f3e8; color: #1f7a47; }
   .ho-consumed { background: #e6edfb; color: #2c4fa6; }
   .ho-dropped  { background: #eceef1; color: #6b7385; }
+  /* The ONE canonical tree. Ghost grammar: dashed + italic + hollow = expected-but-not-present. */
   .tree { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
     padding: 14px 16px; margin-bottom: 12px; }
-  .tree-root { font-weight: 600; }
+  .tree-root { font-weight: 600; display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
   .branches { list-style: none; margin: 10px 0 0; padding: 0 0 0 6px; }
-  .branch { display: flex; gap: 10px; align-items: baseline; padding: 6px 0 6px 14px;
+  .branch { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; padding: 6px 0 6px 14px;
     border-left: 2px solid var(--line); margin-left: 4px; }
   .branch-node { color: #333a48; }
-  .timeline { display: grid; gap: 12px; }
-  .handoff { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
-  .handoff-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
-  .route { font-weight: 600; }
-  .arrow { color: var(--accent); padding: 0 4px; }
-  .directive { margin: 8px 0 10px; color: #333a48; }
-  .return-note { margin: 10px 0 0; padding: 8px 12px; background: #f3f6f5; border-radius: 8px; font-size: 14px; }
+  .branch.ho-edge { border-left-color: color-mix(in oklab, var(--pending) 55%, var(--line)); }
+  .branch.ghost-branch { border-left-style: dashed; border-left-color: var(--ghost); }
+  .ghost-node { color: var(--ghost); font-style: italic;
+    border: 1px dashed var(--ghost); border-radius: 8px; padding: 2px 10px; }
+  .ghost-node code { font-style: normal; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px; color: var(--ghost); }
+  .badge.ghost-badge { background: transparent; border: 1px dashed var(--ghost); color: var(--ghost); }
+  .annot { color: var(--muted); font-size: 12.5px; }
+
+  /* The ONE canonical handoff timeline: opened dot -> status-colored spine -> terminus. */
+  .timeline { list-style: none; margin: 0; padding: 0; }
+  .ho { position: relative; padding: 0 0 8px 34px; }
+  .ho::before { content: ""; position: absolute; left: 9px; top: 26px; bottom: -2px;
+    width: 2px; background: var(--line); }
+  .ho.is-pending::before { background: none;
+    border-left: 2px dashed color-mix(in oklab, var(--pending) 55%, var(--line)); }
+  .ho::after { content: ""; position: absolute; left: 4px; top: 12px; width: 8px; height: 8px;
+    border-radius: 50%; background: var(--accent); border: 2px solid var(--accent); }
+  .ho.is-pending::after { background: var(--pending-bg); border-color: var(--pending); }
+  .ho-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 12px; padding: 6px 0 2px; }
+  .route { font-weight: 650; }
+  .route .arrow { color: var(--accent); padding: 0 3px; }
+  .ho-row .when { color: var(--muted); font-size: 12.5px; }
+  .ho-body { max-width: 65ch; }
+  .directive { margin: 4px 0 8px; color: #333a48; }
+  .ho-meta { display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 12.5px;
+    align-items: center; margin-bottom: 6px; }
+  .terminus { position: relative; margin: 2px 0 22px; padding: 4px 0 0 34px; font-size: 13.5px; }
+  .terminus::after { content: ""; position: absolute; left: 4px; top: 9px; width: 8px; height: 8px;
+    border-radius: 50%; }
+  .terminus.ret { color: var(--returned); }
+  .terminus.ret::after { background: #fff; border: 2px solid var(--returned); }
+  .terminus.ghost { color: var(--ghost); font-style: italic; }
+  .terminus.ghost::after { background: transparent; border: 2px dashed var(--ghost); }
+  .terminus .who { font-style: normal; font-weight: 600; }
+
+  /* Evidence disclosure — the single reveal affordance (native details, no JS). */
+  details.evidence { margin: 2px 0 4px; }
+  details.evidence > summary { cursor: pointer; list-style: none; display: inline-flex; align-items: center;
+    gap: 8px; color: var(--accent); font-size: 13px; font-weight: 600; padding: 4px 10px 4px 8px;
+    border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+  details.evidence > summary:hover { border-color: var(--accent); }
+  details.evidence > summary::-webkit-details-marker { display: none; }
+  details.evidence > summary::before { content: "\\25B8"; color: var(--muted); }
+  details.evidence[open] > summary::before { content: "\\25BE"; }
+  .ev-body { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+    margin: 8px 0 4px; padding: 14px 16px; }
+  .ev-h { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+    color: var(--muted); margin: 0 0 8px; }
+
+  /* Frozen vs current, per carried concept — the anti-distortion property made legible. */
+  .carry { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
+  .carry:first-of-type { border-top: none; padding-top: 0; margin-top: 0; }
+  .carry-title { font-size: 14px; font-weight: 650; margin: 0 0 8px; display: flex; flex-wrap: wrap;
+    gap: 8px; align-items: baseline; }
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 720px) { .compare { grid-template-columns: 1fr; } }
+  .pane { border-radius: 8px; padding: 10px 12px; font-size: 13.5px; }
+  .pane .pane-h { display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+    font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; margin-bottom: 6px; }
+  .pane p { margin: 0; color: #333a48; }
+  .pane.frozen { background: var(--frozen-bg); border: 1px solid var(--frozen-line); }
+  .pane.frozen .pane-h { color: var(--frozen-ink); }
+  .pane.frozen p { color: var(--frozen-ink); }
+  .pane.current { background: #fff; border: 1px solid var(--line); border-left: 3px solid var(--accent); }
+  .pane.current .pane-h { color: var(--accent); }
+  .drift { font-size: 12.5px; margin: 8px 0 0; padding: 5px 10px; border-radius: 6px; display: inline-block; }
+  .drift.same { background: var(--returned-bg); color: var(--returned); }
+  .drift.moved { background: var(--pending-bg); color: var(--pending); }
+  .return-note { margin: 12px 0 0; padding: 10px 12px; background: #f3f6f5; border-radius: 8px;
+    font-size: 13.5px; border-left: 3px solid var(--returned); }
+  .return-note .ev-h { color: var(--returned); margin-bottom: 4px; }
+  .no-return { margin: 12px 0 0; padding: 10px 12px; border: 1px dashed var(--ghost); border-radius: 8px;
+    color: var(--ghost); font-size: 13.5px; font-style: italic; }
   .empty { color: var(--muted); font-style: italic; }
 
   /* Sticky toolbar: pool-scale overview + the project switcher ride along as you scroll. */
@@ -852,13 +933,6 @@ const STYLE = `
   details.view[open] > summary::before, details.schema[open] > summary::before { content: "\\25BE  "; }
   details.schema { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 14px; margin: 0 0 18px; }
 
-  /* Representation switch: tree|diagram|table (lineage) and cards|table|timeline (handoffs) are an
-     exclusive group via the native details[name] grouping; the summaries read as selectable pills. No JS. */
-  .switch { margin: 8px 0 0; }
-  .switch > details.view > summary { display: inline-block; padding: 3px 12px; margin: 0 0 8px;
-    border: 1px solid var(--line); border-radius: 999px; color: var(--accent); font-weight: 600; }
-  .switch > details.view > summary::before { content: ""; margin: 0; }
-  .switch > details.view[open] > summary { background: var(--accent); color: #fff; border-color: var(--accent); }
   table { border-collapse: collapse; width: 100%; font-size: 13px; margin: 8px 0 2px; }
   thead th { position: sticky; top: 0; background: var(--panel); text-align: left;
     font-size: 11.5px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted);
@@ -867,25 +941,9 @@ const STYLE = `
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   td.zero { color: var(--line); text-align: center; }
   th.rt { text-align: left; font-weight: 600; color: var(--ink); }
-  td.clamp2 { max-width: 280px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
   table code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
   .matrix th, .matrix td { text-align: center; }
   .matrix th.rt { text-align: left; }
-
-  /* Hand-rolled SVG diagrams (no graph-viz library). */
-  .lineage-svg, .timeline-svg { width: 100%; height: auto; background: var(--panel);
-    border: 1px solid var(--line); border-radius: 10px; margin: 8px 0; }
-  .ln-node { fill: #ffffff; stroke: var(--line); }
-  .ln-root { fill: #eef5f4; stroke: var(--accent); }
-  .ln-text { font-size: 12px; fill: var(--ink); }
-  .ln-edge { fill: none; stroke: var(--line); stroke-width: 1.5; }
-  .tl-line { stroke: var(--muted); stroke-width: 2; }
-  .tl-line.ho-pending { stroke: #9a6b16; }
-  .tl-line.ho-returned { stroke: #1f7a47; }
-  .tl-line.ho-consumed { stroke: #2c4fa6; }
-  .tl-open { fill: var(--accent); }
-  .tl-ret { fill: #ffffff; stroke: var(--accent); stroke-width: 1.5; }
-  .tl-label { font-size: 11px; fill: var(--ink); }
 
   /* Rich concept bodies: escape-first markdown subset + mermaid (the carve-out). */
   /* lists inside concept bodies (white-space: normal — the pre-wrap parent must not add breaks) */
@@ -967,10 +1025,10 @@ export function renderHtml(db: Database, opts: ViewOpts = {}): string {
   // Small pools stay open and scannable; large ones collapse to an index of project headers. A
   // project scoped via ?project= is always open.
   const isOpen = (p: ProjectBucket) => projects.length <= 3 || opts.only === p.id;
-  const resolve = buildWikiResolver(db);
+  const ctx = buildPoolCtx(db);
   const sections =
     shown.length > 0
-      ? shown.map((p) => renderProjectSection(p, opts, isOpen(p), resolve)).join("")
+      ? shown.map((p) => renderProjectSection(p, opts, isOpen(p), ctx)).join("")
       : `<p class="empty">Nothing in the pool yet.</p>`;
 
   return `<!doctype html>

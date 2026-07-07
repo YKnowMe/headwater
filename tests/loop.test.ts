@@ -505,23 +505,28 @@ test("render includes a schema panel listing the six tables with live counts", (
   rdb.close();
 });
 
-test("render adds a lineage SVG diagram and an adjacency table when edges exist", () => {
+test("lineage renders ONE canonical tree — the SVG diagram and adjacency table are pruned", () => {
   const rdb = initDb(":memory:");
   const parent = writeConcept(rdb, { project: "p", type: "decision", title: "Parent", body: "p", surface: "s" });
-  forkConcept(rdb, { parent_id: parent.id, body: "child body", surface: "s", title: "Child" });
+  forkConcept(rdb, { parent_id: parent.id, body: "child body", surface: "s", title: "Child", reason: "inference" });
   const html = renderHtml(rdb);
-  expect(html).toContain('class="lineage-svg"');
-  expect(html).toContain('<table class="ltbl">');
+  expect(html).toContain('<div class="tree">');
+  // a fork edge's whole evidence (kind + reason badges) fits inline on the branch row — no reveal needed
+  expect(html).toMatch(/class="branch"[\s\S]*?badge edge[\s\S]*?badge reason/);
+  expect(html).not.toContain('lineage-svg');
+  expect(html).not.toContain('class="ltbl"');
   rdb.close();
 });
 
-test("render adds a handoff table and an SVG timeline when handoffs exist", () => {
+test("handoffs render ONE canonical spine timeline — cards/table/SVG variants are pruned", () => {
   const rdb = initDb(":memory:");
   const a = writeConcept(rdb, { project: "p", type: "note", title: "A", body: "a", surface: "s1" });
   openHandoff(rdb, { project: "p", from_surface: "s1", to_surface: "s2", concept_ids: [a.id], directive: "do x" });
   const html = renderHtml(rdb);
-  expect(html).toContain('<table class="htbl">');
-  expect(html).toContain('class="timeline-svg"');
+  expect(html).toContain('<ul class="timeline">');
+  expect(html).toContain('class="ho is-pending"');
+  expect(html).not.toContain('class="htbl"');
+  expect(html).not.toContain('timeline-svg');
   rdb.close();
 });
 
@@ -533,26 +538,105 @@ test("render adds a type x status matrix per project", () => {
   rdb.close();
 });
 
-test("lineage representations form an exclusive switch (one open at a time, tree by default)", () => {
+test("the lineage/handoff representation switches are gone — one tree, one timeline", () => {
   const rdb = initDb(":memory:");
   const parent = writeConcept(rdb, { project: "p", type: "decision", title: "Parent", body: "p", surface: "s" });
   forkConcept(rdb, { parent_id: parent.id, body: "c", surface: "s", title: "Child" });
+  openHandoff(rdb, { project: "p", from_surface: "s1", to_surface: "s2", concept_ids: [parent.id], directive: "do x" });
   const html = renderHtml(rdb);
-  // three views share one <details name> group -> native exclusive switch; the tree is open by default
-  const grouped = html.match(/<details class="view" name="lin-[^"]+"/g) ?? [];
-  expect(grouped.length).toBe(3);
-  expect(html).toMatch(/<details class="view" name="lin-[^"]+" open><summary>Tree<\/summary>/);
+  expect(html).not.toMatch(/<details class="view" name="lin-/);
+  expect(html).not.toMatch(/<details class="view" name="ho-/);
   rdb.close();
 });
 
-test("handoff representations form an exclusive switch (cards by default)", () => {
+// --- render.ts: the settled timeline/lineage pass (handoff-0a0b4ed8) ------------------------------
+// Decisions: (1) inline-expand evidence via ONE native <details>; (2) frozen vs current side-by-side
+// panes + a drift verdict; (3) one vertical spine timeline; (4) the ghost grammar — dashed/italic/
+// hollow = expected-but-not-present — for open loops and dangling wikilinks.
+
+test("a returned handoff shows route, badge, evidence with its return note, and a returned terminus", () => {
   const rdb = initDb(":memory:");
-  const a = writeConcept(rdb, { project: "p", type: "note", title: "A", body: "a", surface: "s1" });
-  openHandoff(rdb, { project: "p", from_surface: "s1", to_surface: "s2", concept_ids: [a.id], directive: "do x" });
+  const a = writeConcept(rdb, { project: "p", type: "note", title: "Carried", body: "cargo", surface: "alpha" });
+  const h = openHandoff(rdb, { project: "p", from_surface: "alpha", to_surface: "beta", concept_ids: [a.id], directive: "go" });
+  returnHandoff(rdb, { handoff_id: h.id, return_note: "came back with results" });
   const html = renderHtml(rdb);
-  const grouped = html.match(/<details class="view" name="ho-[^"]+"/g) ?? [];
-  expect(grouped.length).toBe(3); // cards | table | timeline
-  expect(html).toMatch(/<details class="view" name="ho-[^"]+" open><summary>Cards<\/summary>/);
+  expect(html).toContain('class="ho is-returned"');
+  expect(html).toMatch(/class="route">alpha <span class="arrow">&rarr;<\/span> beta/);
+  expect(html).toContain('<details class="evidence">');
+  expect(html).toMatch(/class="return-note"[\s\S]*?came back with results/);
+  expect(html).toMatch(/class="terminus ret"><span class="who">beta<\/span> returned/);
+  rdb.close();
+});
+
+test("a pending handoff is the open-loop shape: dashed spine class, open evidence, no-return placeholder, ghost terminus", () => {
+  const rdb = initDb(":memory:");
+  const a = writeConcept(rdb, { project: "p", type: "note", title: "Carried", body: "cargo", surface: "alpha" });
+  openHandoff(rdb, { project: "p", from_surface: "alpha", to_surface: "beta", concept_ids: [a.id], directive: "go" });
+  const html = renderHtml(rdb);
+  expect(html).toContain('class="ho is-pending"');
+  expect(html).toContain('<details class="evidence" open>'); // the open loop's evidence starts revealed
+  expect(html).toContain('<div class="no-return">no return note yet — the loop is open</div>');
+  expect(html).toMatch(/class="terminus ghost"><span class="who">beta<\/span> has not written back — awaiting return/);
+  rdb.close();
+});
+
+test("evidence shows frozen and current panes per carried concept; untouched concepts read 'unchanged'", () => {
+  const rdb = initDb(":memory:");
+  const a = writeConcept(rdb, { project: "p", type: "note", title: "Carried", body: "the frozen cargo body", surface: "alpha" });
+  openHandoff(rdb, { project: "p", from_surface: "alpha", to_surface: "beta", concept_ids: [a.id], directive: "go" });
+  const html = renderHtml(rdb);
+  expect(html).toContain("frozen — as handed off");
+  expect(html).toContain("current — in pool now");
+  // both panes carry the body (immutable + unforked -> identical), and the verdict is green/unchanged
+  expect(html.split("the frozen cargo body").length).toBeGreaterThanOrEqual(3);
+  expect(html).toContain('<span class="drift same">unchanged since handoff</span>');
+  rdb.close();
+});
+
+test("a concept forked after the handoff reads as drift, naming the fork id", () => {
+  const rdb = initDb(":memory:");
+  const a = writeConcept(rdb, { project: "p", type: "note", title: "Carried", body: "cargo", surface: "alpha" });
+  openHandoff(rdb, { project: "p", from_surface: "alpha", to_surface: "beta", concept_ids: [a.id], directive: "go" });
+  const f = forkConcept(rdb, { parent_id: a.id, body: "moved on", surface: "beta" });
+  const html = renderHtml(rdb);
+  expect(html).toMatch(new RegExp(`class="drift moved">diverged — 1 fork since handoff: <code class="id">${f.id}</code>`));
+  rdb.close();
+});
+
+test("a pending handoff gives its carried concept a tree: the handoff edge + the expected-return ghost branch", () => {
+  const rdb = initDb(":memory:");
+  const a = writeConcept(rdb, { project: "p", type: "note", title: "Carried", body: "cargo", surface: "alpha" });
+  const h = openHandoff(rdb, { project: "p", from_surface: "alpha", to_surface: "beta", concept_ids: [a.id], directive: "go" });
+  const html = renderHtml(rdb);
+  expect(html).toMatch(/class="branch ho-edge"[\s\S]*?handoff · pending[\s\S]*?carried by/);
+  expect(html).toContain(`<code class="id">${h.id}</code>`);
+  expect(html).toMatch(/class="branch ghost-branch"[\s\S]*?expected[\s\S]*?return concept from <code>beta<\/code> — not yet in pool/);
+  rdb.close();
+});
+
+test("a tree root whose body cites a missing concept grows a dangling-link ghost branch", () => {
+  const rdb = initDb(":memory:");
+  const root = writeConcept(rdb, {
+    project: "p", type: "note", title: "Root", surface: "s",
+    body: "see [[missing-spec]] and [[also-missing]]",
+  });
+  forkConcept(rdb, { parent_id: root.id, body: "child", surface: "s", title: "Child" });
+  const html = renderHtml(rdb);
+  expect(html).toMatch(/class="branch ghost-branch"[\s\S]*?dangling link[\s\S]*?\[\[missing-spec\]\]<\/code> — no such concept in the pool/);
+  expect(html).toMatch(/\[\[also-missing\]\]<\/code> — no such concept in the pool/);
+  rdb.close();
+});
+
+test("wikilinks inside a handoff directive resolve like concept bodies (link or ghost)", () => {
+  const rdb = initDb(":memory:");
+  const a = writeConcept(rdb, { project: "p", type: "note", title: "Target", body: "t", surface: "s" });
+  openHandoff(rdb, {
+    project: "p", from_surface: "s", to_surface: "s2", concept_ids: [a.id],
+    directive: `read [[${a.id}]] and [[nowhere-to-be-found]]`,
+  });
+  const html = renderHtml(rdb);
+  expect(html).toContain(`<a class="wl" href="#${a.id}">[[${a.id}]]</a>`);
+  expect(html).toContain('<span class="wl-ghost" title="referenced concept id not present in the pool">[[nowhere-to-be-found]]</span>');
   rdb.close();
 });
 
