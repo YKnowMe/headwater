@@ -15,12 +15,29 @@
 // Run: `bun run backup`. Restore is a documented manual procedure — see README.
 
 import { Database } from "bun:sqlite";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { resolveDataDir, resolveDbPath } from "../src/db.ts";
 
 export const DEFAULT_KEEP = 14;
+
+/**
+ * mkdir -p that tolerates the directory already existing.
+ *
+ * Not the same as bare `mkdirSync(dir, {recursive: true})`: OneDrive folders are cloud-placeholder
+ * reparse points (tag 0x9000e01a), and on those Bun's recursive mkdir throws EEXIST rather than
+ * no-opping. That made the offsite copy succeed exactly once and fail every run afterwards. An
+ * EEXIST over a real directory is the outcome we wanted; an EEXIST over a FILE is not, so re-throw.
+ */
+export function ensureDir(dir: string): void {
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    if (!statSync(dir).isDirectory()) throw new Error(`backup: ${dir} exists but is not a directory`);
+  }
+}
 
 export interface PoolCounts {
   concept: number;
@@ -163,7 +180,7 @@ export function main(now: Date = new Date()): number {
   }
 
   const localDir = resolveLocalBackupDir();
-  mkdirSync(localDir, { recursive: true });
+  ensureDir(localDir);
 
   const prev = previousCounts(localDir);
 
@@ -195,7 +212,7 @@ export function main(now: Date = new Date()): number {
     console.error(`backup: offsite parent missing (${offsiteParent}) — local snapshot kept, pruned nothing`);
     return 1;
   }
-  mkdirSync(offsiteDir, { recursive: true });
+  ensureDir(offsiteDir);
   const offsiteTmp = join(offsiteDir, `.${name}.tmp`);
   copyFileSync(localFinal, offsiteTmp);
   publish(offsiteTmp, join(offsiteDir, name));

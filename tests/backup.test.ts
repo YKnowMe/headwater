@@ -30,6 +30,7 @@ import {
   publish,
   prune,
   main,
+  ensureDir,
   resolveKeep,
   resolveOffsiteDir,
   previousCounts,
@@ -251,6 +252,31 @@ function offsiteUnder(root: string): string {
   mkdirSync(join(root, "cloud"), { recursive: true });
   return join(root, "cloud", "headwater-backups");
 }
+
+// Regression: `bun run backup` succeeded once, then failed on every later run. The offsite dir
+// (~/OneDrive/headwater-backups) is a cloud-placeholder REPARSE POINT — `fsutil` reports tag
+// 0x9000e01a — and Bun's mkdirSync(..., {recursive: true}) throws EEXIST on those instead of
+// no-opping, while behaving correctly on ordinary directories. Temp dirs are ordinary, so no test
+// could reproduce it; only a second real run against OneDrive did. ensureDir() must be idempotent
+// whatever the directory is, so we pin the contract here.
+test("ensureDir is idempotent — creating an existing directory is a no-op, not an error", () => {
+  const dir = join(tempDir, "nested", "leaf");
+
+  ensureDir(dir); // creates, including the missing parent
+  expect(existsSync(dir)).toBe(true);
+
+  expect(() => ensureDir(dir)).not.toThrow(); // the call that used to blow up on OneDrive
+  expect(() => ensureDir(dir)).not.toThrow();
+  expect(existsSync(dir)).toBe(true);
+});
+
+test("ensureDir swallows EEXIST but still reports a genuine failure", () => {
+  // A FILE where a directory should be: mkdir fails with EEXIST too, but the path is unusable.
+  // Swallowing EEXIST blindly would let main() march on and fail confusingly at copyFileSync.
+  const blocker = join(tempDir, "not-a-dir");
+  writeFileSync(blocker, "");
+  expect(() => ensureDir(blocker)).toThrow(/not a directory/i);
+});
 
 test("resolveKeep honours a valid override and falls back otherwise", () => {
   expect(resolveKeep()).toBe(DEFAULT_KEEP);
