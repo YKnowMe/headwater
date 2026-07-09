@@ -76,6 +76,11 @@ export interface ReturnHandoffArgs {
 /** A concept as the kickoff presents it: the row minus `body`, plus a bounded `body_preview`. */
 export type ConceptSummary = Omit<ConceptRow, "body"> & { body_preview: string; closed_by?: ClosedBy };
 
+/** A concept as recents present it: identity only — the full summary already sits in concepts_by_status. */
+export type ConceptHead = Pick<ConceptRow, "id" | "type" | "title" | "status" | "created_at"> & {
+  closed_by?: ClosedBy;
+};
+
 /** How a concept was derived-closed: the closing fork's id and which rule fired. */
 export type ClosedBy = { concept_id: string; via: "supersedes" | "decision" };
 
@@ -86,7 +91,7 @@ export interface ProjectState {
   concepts_by_status: Record<ConceptStatus, ConceptSummary[]>;
   open_handoffs: Array<Record<string, unknown>>;
   recent_handoffs: Array<Record<string, unknown>>;
-  recent_concepts: ConceptSummary[];
+  recent_concepts: ConceptHead[];
 }
 
 // --- Internal helpers -------------------------------------------------------
@@ -135,10 +140,15 @@ function presentHandoff(row: HandoffRow): Record<string, unknown> {
 // remains the full-recall path. Presentation only — stored rows and frozen snapshots are untouched.
 const PREVIEW_CHARS = 280;
 
+/** Flatten whitespace and truncate to PREVIEW_CHARS with an ellipsis. */
+function previewText(s: string): string {
+  const flat = s.replace(/\s+/g, " ").trim();
+  return flat.length > PREVIEW_CHARS ? flat.slice(0, PREVIEW_CHARS) + "…" : flat;
+}
+
 function summarize(c: ConceptRow): ConceptSummary {
   const { body, ...rest } = c;
-  const flat = body.replace(/\s+/g, " ").trim();
-  return { ...rest, body_preview: flat.length > PREVIEW_CHARS ? flat.slice(0, PREVIEW_CHARS) + "…" : flat };
+  return { ...rest, body_preview: previewText(body) };
 }
 
 // Closing edge kinds for the open_question-answered-by-decision rule. annotates (a comment),
@@ -183,6 +193,55 @@ function presentHandoffPreview(row: HandoffRow): Record<string, unknown> {
     );
   }
   return presented;
+}
+
+/**
+ * A RETURNED handoff as the kickoff presents it: archive, not payload. The directive and return
+ * note arrive as bounded previews and the frozen snapshot shrinks to ids+titles — full recall is
+ * the viewer today, read_handoff when it ships (Spec B). Pending handoffs never come through here:
+ * their directive is what the receiver must act on, so presentHandoffPreview keeps it whole.
+ */
+export function presentHandoffArchive(row: HandoffRow): Record<string, unknown> {
+  let heads: Array<{ id: string; title: string }> = [];
+  try {
+    const snap = JSON.parse(row.payload_snapshot) as Array<{ id?: unknown; title?: unknown }>;
+    if (Array.isArray(snap)) heads = snap.map((c) => ({ id: String(c.id ?? ""), title: String(c.title ?? "") }));
+  } catch {
+    // unparseable snapshot: present no heads rather than fail the kickoff
+  }
+  const { directive, return_note, payload_snapshot, ...rest } = row;
+  return {
+    ...rest,
+    directive_preview: previewText(directive),
+    return_note_preview: previewText(return_note ?? ""),
+    payload_snapshot: heads,
+  };
+}
+
+/**
+ * Slim confirmation for the mutation tools. The caller supplied the directive and concept ids;
+ * echoing the frozen 10KB snapshot back at them was pure response weight (and response size is a
+ * live wedge hypothesis). already_returned appears only when true.
+ */
+export function confirmHandoff(row: HandoffRow & { already_returned?: boolean }): Record<string, unknown> {
+  let conceptIds: string[] = [];
+  try {
+    const snap = JSON.parse(row.payload_snapshot) as Array<{ id?: unknown }>;
+    if (Array.isArray(snap)) conceptIds = snap.map((c) => String(c.id ?? ""));
+  } catch {
+    // unparseable snapshot: confirm with no ids rather than fail the mutation
+  }
+  return {
+    id: row.id,
+    project_id: row.project_id,
+    from_surface_id: row.from_surface_id,
+    to_surface_id: row.to_surface_id,
+    status: row.status,
+    initiated_at: row.initiated_at,
+    returned_at: row.returned_at,
+    concept_ids: conceptIds,
+    ...(row.already_returned ? { already_returned: true } : {}),
+  };
 }
 
 // --- The six operations -----------------------------------------------------
@@ -276,7 +335,7 @@ export function readProjectState(db: Database, project: string): ProjectState {
     .all(projectId);
   const recentHandoffs = db
     .query<HandoffRow, [string]>(
-      `SELECT * FROM handoff WHERE project_id = ? ORDER BY initiated_at DESC LIMIT 10`,
+      `SELECT * FROM handoff WHERE project_id = ? AND status <> 'pending' ORDER BY initiated_at DESC LIMIT 10`,
     )
     .all(projectId);
   const recentConcepts = db
@@ -291,12 +350,17 @@ export function readProjectState(db: Database, project: string): ProjectState {
     name: projectRow?.name ?? project,
     concepts_by_status: byStatus,
     open_handoffs: openHandoffs.map(presentHandoffPreview),
-    recent_handoffs: recentHandoffs.map(presentHandoffPreview),
+    recent_handoffs: recentHandoffs.map(presentHandoffArchive),
     recent_concepts: recentConcepts.map((c) => {
-      const s = summarize(c);
       const cb = closures.get(c.id);
-      if (cb) s.closed_by = cb;
-      return s;
+      return {
+        id: c.id,
+        type: c.type,
+        title: c.title,
+        status: c.status,
+        created_at: c.created_at,
+        ...(cb ? { closed_by: cb } : {}),
+      };
     }),
   };
 }
@@ -496,7 +560,7 @@ export function registerTools(server: McpServer, db: Database): void {
     },
     async (args) => {
       try {
-        return ok(presentHandoff(openHandoff(db, args)));
+        return ok(confirmHandoff(openHandoff(db, args)));
       } catch (err) {
         return fail(err);
       }
@@ -515,7 +579,7 @@ export function registerTools(server: McpServer, db: Database): void {
     },
     async (args) => {
       try {
-        return ok(presentHandoff(returnHandoff(db, args)));
+        return ok(confirmHandoff(returnHandoff(db, args)));
       } catch (err) {
         return fail(err);
       }

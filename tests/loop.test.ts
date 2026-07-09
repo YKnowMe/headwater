@@ -920,7 +920,10 @@ test("short bodies survive a kickoff preview verbatim (minus nothing)", () => {
   const rdb = initDb(":memory:");
   writeConcept(rdb, { project: "big", type: "note", title: "SHORT", body: "small body", surface: "s" });
   const state = readProjectState(rdb, "big");
-  expect(state.recent_concepts[0]!.body_preview).toBe("small body");
+  expect(state.concepts_by_status.active[0]!.body_preview).toBe("small body");
+  // recents are heads: identity only — the summary above is the single copy of the preview
+  expect(state.recent_concepts[0]!.title).toBe("SHORT");
+  expect("body_preview" in state.recent_concepts[0]!).toBe(false);
   rdb.close();
 });
 

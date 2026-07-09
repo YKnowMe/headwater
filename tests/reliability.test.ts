@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb } from "../src/db.ts";
-import { writeConcept, openHandoff, returnHandoff } from "../src/server.ts";
+import { writeConcept, openHandoff, returnHandoff, readProjectState, confirmHandoff } from "../src/server.ts";
 import type { HandoffRow } from "../src/db.ts";
 
 let tempDir: string;
@@ -138,4 +138,88 @@ test("an existing v2 pool gains the trigger on next open (version gate re-runs t
     .get("handoff_return_is_one_way");
   expect(trig?.name).toBe("handoff_return_is_one_way");
   reopened.close();
+});
+
+// --- state shape: dedupe + archive previews + heads ------------------------------------------
+
+test("recent_handoffs excludes pending handoffs (they live in open_handoffs, once)", () => {
+  const h = seedHandoff();
+  const state = readProjectState(db, "rel-test");
+  expect(state.open_handoffs).toHaveLength(1);
+  expect(state.recent_handoffs).toHaveLength(0); // pending is NOT duplicated here
+
+  returnHandoff(db, { handoff_id: h.id, return_note: "closed" });
+  const after = readProjectState(db, "rel-test");
+  expect(after.open_handoffs).toHaveLength(0);
+  expect(after.recent_handoffs).toHaveLength(1);
+});
+
+test("a pending handoff keeps its WHOLE directive; a returned one carries previews only", () => {
+  const longDirective = "directive-head " + "d".repeat(2000) + " directive-tail";
+  const h = seedHandoff({ directive: longDirective });
+
+  const pendingState = readProjectState(db, "rel-test");
+  const open = pendingState.open_handoffs[0]! as Record<string, unknown>;
+  expect(open.directive).toBe(longDirective); // the actionable payload arrives whole
+
+  const longNote = "note-head " + "n".repeat(2000) + " note-tail";
+  returnHandoff(db, { handoff_id: h.id, return_note: longNote });
+  const returnedState = readProjectState(db, "rel-test");
+  const arch = returnedState.recent_handoffs[0]! as Record<string, unknown>;
+  expect("directive" in arch).toBe(false);
+  expect("return_note" in arch).toBe(false);
+  expect((arch.directive_preview as string).startsWith("directive-head")).toBe(true);
+  expect((arch.directive_preview as string).length).toBeLessThanOrEqual(281); // 280 + ellipsis
+  expect((arch.return_note_preview as string).startsWith("note-head")).toBe(true);
+  expect(JSON.stringify(arch)).not.toContain("directive-tail");
+  expect(JSON.stringify(arch)).not.toContain("note-tail");
+});
+
+test("an archived handoff's payload_snapshot is ids+titles only", () => {
+  const h = seedHandoff();
+  returnHandoff(db, { handoff_id: h.id, return_note: "closed" });
+  const state = readProjectState(db, "rel-test");
+  const snap = (state.recent_handoffs[0]! as Record<string, unknown>).payload_snapshot as Array<
+    Record<string, unknown>
+  >;
+  expect(snap).toHaveLength(1);
+  expect(Object.keys(snap[0]!).sort()).toEqual(["id", "title"]);
+  expect(snap[0]!.title).toBe("carried");
+});
+
+test("recent_concepts are heads: no body_preview (every entry is already in concepts_by_status)", () => {
+  writeConcept(db, {
+    project: "rel-test",
+    type: "note",
+    title: "T",
+    body: "some body text",
+    surface: "test:rel",
+  });
+  const state = readProjectState(db, "rel-test");
+  const rc = state.recent_concepts[0]! as Record<string, unknown>;
+  expect(rc.id).toBeDefined();
+  expect(rc.title).toBe("T");
+  expect("body_preview" in rc).toBe(false);
+  expect("body" in rc).toBe(false);
+  // the full-summary form still exists exactly once, in concepts_by_status
+  expect(state.concepts_by_status.active.some((c) => c.title === "T" && "body_preview" in c)).toBe(true);
+});
+
+// --- mutation confirmations: no more echoing the frozen snapshot back at the caller ----------
+
+test("confirmHandoff is a slim confirmation: concept ids, no directive, no snapshot bodies", () => {
+  const h = seedHandoff({ directive: "a long directive the caller already has" });
+  const conf = confirmHandoff(h);
+  expect(conf.id).toBe(h.id);
+  expect(conf.status).toBe("pending");
+  expect(Array.isArray(conf.concept_ids)).toBe(true);
+  expect((conf.concept_ids as string[]).length).toBe(1);
+  expect("directive" in conf).toBe(false);
+  expect("payload_snapshot" in conf).toBe(false);
+  expect("already_returned" in conf).toBe(false); // only present when true
+
+  const r = returnHandoff(db, { handoff_id: h.id, return_note: "done" });
+  const retry = returnHandoff(db, { handoff_id: h.id, return_note: "done" });
+  expect(confirmHandoff(retry).already_returned).toBe(true);
+  expect(confirmHandoff(r).returned_at).toBe(r.returned_at);
 });
