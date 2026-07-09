@@ -70,7 +70,11 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
   - **Lineage is append-only.** Edges go from child (`from_concept_id`) → parent (`to_concept_id`).
     The original is the canonical root; branches hang off it. The original is never touched by a fork.
   - **Handoff `payload_snapshot` and `directive` are frozen at creation.** Only `status`/`returned_at`/
-    `return_note` move in place (`pending → returned` in v1).
+    `return_note` move in place, and the transition is **one-way**: `pending → returned` is the only
+    status change the substrate admits (schema-v3 trigger `handoff_return_is_one_way`), so a stored
+    return can never be overwritten — a retried `return_handoff` with the identical note is a no-op
+    (`already_returned: true`), a different note is refused naming the stored `returned_at`. The
+    `consumed`/`dropped` headroom statuses are unreachable until that trigger is deliberately revised.
   - IDs are stable slugs; timestamps are ISO `TEXT`.
   - **Enforced at the substrate (schema v2).** `BEFORE UPDATE/DELETE` triggers reject any write that
     violates the above — concept immutable, lineage + `handoff_concept` append-only, handoff frozen except
@@ -90,6 +94,12 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
   supersedes answers an `open_question`; annotates/relates_to/depends_on never close) — a derived-closed
   concept presents under `resolved` with `closed_by`, its stored status untouched. The viewer groups and
   badges the same way. Do not add a status-update path; this is the settled alternative.
+  Pending handoffs arrive once (in `open_handoffs`, directive whole — it is the actionable payload);
+  returned handoffs are archive: `directive_preview`/`return_note_preview` (280 chars) + ids+titles
+  snapshots. `recent_concepts` are heads (id/type/title/status/created_at) — their full summaries sit in
+  `concepts_by_status`. Oversized responses (default cap 131072 bytes, `HEADWATER_MAX_RESPONSE_BYTES`)
+  **degrade** to ids+titles+counts with `degraded: true` — never an error. `open_handoff`/`return_handoff`
+  return slim confirmations (id, surfaces, status, timestamps, concept_ids), not the frozen snapshot.
 - `open_handoff(project, from_surface, to_surface, concept_ids, directive)` → `pending` handoff with a
   frozen JSON `payload_snapshot` of the named concepts + `handoff_concept` join rows.
 - `return_handoff(handoff_id, return_note)` → `status=returned`, `returned_at=now`, `return_note`.
@@ -112,3 +122,5 @@ layers. No graph-viz library — **except** the one recorded carve-out above (a 
 - `bun run start` — MCP server (stdio). `bun run render` — write `index.html`. `bun run serve` — live viewer
   with a Refresh button. `bun run backup` — verified pool snapshot → local history + offsite. `bun test` — tests.
 - stdio is the MCP channel: never write to **stdout** from the server; logs go to **stderr**.
+  Every tool call appends one JSONL line (op, project, ok, ms, req/resp bytes, degraded, error) to
+  `<data dir>/headwater.log` — a file, never stderr: an undrained stderr pipe would wedge the server.

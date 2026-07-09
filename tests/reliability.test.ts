@@ -330,3 +330,142 @@ test("unknown op is a clean isError, not a throw", () => {
   expect(res.isError).toBe(true);
   expect(res.content[0]!.text).toContain("unknown tool");
 });
+
+// --- 10x scale + the wedge pattern over REAL stdio -------------------------------------------
+// Wedge #2 (2026-07-09): a successful ~106KB read_project_state, then the immediately following
+// return_handoff hung past the client relay's 4-minute timeout — mechanism undiagnosed. In-process
+// calls cannot exercise the transport, so this spawns the actual server (src/index.ts) and speaks
+// newline-delimited JSON-RPC over its real stdin/stdout, at ~10x today's scale.
+
+const TEN_X = { concepts: 600, handoffs: 50, directiveBytes: 5_000 };
+
+function seedTenX(dbx: Database): string[] {
+  const ids: string[] = [];
+  for (let i = 0; i < TEN_X.concepts; i++) {
+    ids.push(
+      writeConcept(dbx, {
+        project: "scale",
+        type: "note",
+        title: `concept ${i}`,
+        body: `body ${i} ` + "x".repeat(600),
+        surface: "test:scale",
+      }).id,
+    );
+  }
+  for (let i = 0; i < TEN_X.handoffs; i++) {
+    const h = openHandoff(dbx, {
+      project: "scale",
+      from_surface: "test:a",
+      to_surface: "test:b",
+      concept_ids: [ids[i % ids.length]!],
+      directive: `directive ${i} ` + "d".repeat(TEN_X.directiveBytes),
+    });
+    if (i % 2 === 0) returnHandoff(dbx, { handoff_id: h.id, return_note: `note ${i} ` + "n".repeat(2_000) });
+  }
+  return ids;
+}
+
+test("read_project_state stays under 2s and under the cap at 10x scale", () => {
+  seedTenX(db);
+  const t0 = performance.now();
+  const res = callTool(db, "read_project_state", { project: "scale" });
+  const ms = performance.now() - t0;
+  expect(res.isError).toBeUndefined();
+  expect(ms).toBeLessThan(2_000); // spec acceptance: lean state read < 2s at 10x
+  console.error(`[scale] read_project_state at 10x: ${Math.round(ms)}ms, ${res.content[0]!.text.length} bytes`);
+}, 30_000);
+
+test("wedge soak: heavy read -> immediate return_handoff over real stdio, repeatedly", async () => {
+  seedTenX(db);
+  // fresh pending handoffs to return during the soak, one per iteration
+  const cid = writeConcept(db, {
+    project: "scale", type: "note", title: "soak cargo", body: "c", surface: "test:scale",
+  }).id;
+  const pending: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    pending.push(
+      openHandoff(db, {
+        project: "scale", from_surface: "test:a", to_surface: "test:b",
+        concept_ids: [cid], directive: `soak ${i} ` + "d".repeat(TEN_X.directiveBytes),
+      }).id,
+    );
+  }
+  db.close(); // the spawned server owns the pool now (reopened by afterEach's close via initDb below)
+
+  const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "..", "src", "index.ts")], {
+    env: { ...process.env, HEADWATER_DATA_DIR: tempDir },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+
+  const reader = proc.stdout.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  /** Read frames until the message with this id arrives, or the deadline passes. */
+  async function readUntil(id: number, deadlineMs: number): Promise<Record<string, unknown>> {
+    const deadline = Date.now() + deadlineMs;
+    for (;;) {
+      const nl = buffer.indexOf("\n");
+      if (nl >= 0) {
+        const frame = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (frame.trim()) {
+          const msg = JSON.parse(frame) as Record<string, unknown>;
+          if (msg.id === id) return msg;
+          continue; // a notification or another id — keep reading
+        }
+        continue;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error(`no response for id ${id} within ${deadlineMs}ms — WEDGE?`);
+      const chunk = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`stdout read stalled (id ${id}) — WEDGE?`)), remaining)),
+      ]);
+      if (chunk.done) throw new Error("server closed stdout");
+      buffer += decoder.decode(chunk.value);
+    }
+  }
+  function send(msg: Record<string, unknown>): void {
+    proc.stdin.write(JSON.stringify(msg) + "\n");
+    proc.stdin.flush();
+  }
+
+  try {
+    send({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "wedge-soak", version: "0" } },
+    });
+    await readUntil(1, 10_000);
+    send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    let nextId = 2;
+    for (const handoffId of pending) {
+      const readId = nextId++;
+      const t0 = performance.now();
+      send({
+        jsonrpc: "2.0", id: readId, method: "tools/call",
+        params: { name: "read_project_state", arguments: { project: "scale" } },
+      });
+      await readUntil(readId, 5_000); // the heavy read must answer promptly
+      const readMs = Math.round(performance.now() - t0);
+
+      const writeId = nextId++;
+      const t1 = performance.now();
+      send({
+        jsonrpc: "2.0", id: writeId, method: "tools/call",
+        params: { name: "return_handoff", arguments: { handoff_id: handoffId, return_note: `soak return ${handoffId}` } },
+      });
+      const writeResp = (await readUntil(writeId, 5_000)) as { result?: { isError?: boolean } };
+      const writeMs = Math.round(performance.now() - t1);
+      expect(writeResp.result?.isError).toBeFalsy();
+      console.error(`[soak] read ${readMs}ms -> return ${writeMs}ms (${handoffId})`);
+    }
+    console.error("[soak] wedge pattern did NOT reproduce: 5x heavy-read -> immediate-return, all under deadline");
+  } finally {
+    proc.kill();
+    await proc.exited;
+    db = initDb(join(tempDir, "pool.db")); // afterEach closes db; reopen so it has one to close
+  }
+}, 60_000);

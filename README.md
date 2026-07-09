@@ -53,6 +53,11 @@ One authoritative SQLite pool, stored **outside the repo**:
 
 - Default: `~/.workspace/pool.db`
 - Override the directory with the `HEADWATER_DATA_DIR` environment variable.
+- Every tool call appends one JSON line to `<data dir>/headwater.log` (op, project, outcome, duration,
+  request/response bytes) — the first place to look when a client misbehaves.
+- `read_project_state` responses over 128 KB (override: `HEADWATER_MAX_RESPONSE_BYTES`) degrade to
+  ids + titles + counts with `degraded: true` instead of ever exceeding the budget; `read_concept(id)`
+  recalls any full text.
 
 The repo holds code only — the pool, `*.db`, and the generated `index.html` are git-ignored.
 
