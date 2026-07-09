@@ -15,7 +15,8 @@
 // Run: `bun run backup`. Restore is a documented manual procedure — see README.
 
 import { Database } from "bun:sqlite";
-import { rmSync } from "node:fs";
+import { existsSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { join } from "node:path";
 
 export const DEFAULT_KEEP = 14;
 
@@ -80,4 +81,32 @@ export function verify(snapshotPath: string, prev: PoolCounts | null): PoolCount
     }
   }
   return counts;
+}
+
+/** Matches only published snapshots — never `.tmp` (in flight) or `.rejected` (failed verify). */
+const SNAPSHOT_RE = /^pool-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\.db$/;
+
+/** Published snapshots, oldest first. Lexical sort == chronological, by construction of the name. */
+export function listSnapshots(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((f) => SNAPSHOT_RE.test(f)).sort();
+}
+
+export function newestSnapshot(dir: string): string | null {
+  const all = listSnapshots(dir);
+  return all.length > 0 ? all[all.length - 1]! : null;
+}
+
+/** Atomic within a volume: an interrupted run never leaves a half-written file that looks good. */
+export function publish(tmpPath: string, finalPath: string): void {
+  renameSync(tmpPath, finalPath);
+}
+
+/** Delete all but the `keep` newest snapshots. Returns what was deleted. */
+export function prune(dir: string, keep: number): string[] {
+  if (keep < 1) throw new Error(`keep must be >= 1, got ${keep}`);
+  const all = listSnapshots(dir);
+  const doomed = all.slice(0, Math.max(0, all.length - keep));
+  for (const f of doomed) rmSync(join(dir, f), { force: true });
+  return doomed;
 }

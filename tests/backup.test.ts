@@ -25,6 +25,10 @@ import {
   countsOf,
   integrityOk,
   verify,
+  listSnapshots,
+  newestSnapshot,
+  publish,
+  prune,
 } from "../scripts/backup.ts";
 
 let tempDir: string;
@@ -153,4 +157,80 @@ test("verify rejects a snapshot it cannot read as a pool", () => {
   // Whether it fails at open, at integrity_check, or at `SELECT ... FROM concept`, verify() must throw
   // rather than hand back a snapshot we would then publish and prune against.
   expect(() => verify(junk, null)).toThrow();
+});
+
+/** Create an empty file at `dir/name`. Content is irrelevant to listing/pruning. */
+function touch(dir: string, name: string): void {
+  writeFileSync(join(dir, name), "");
+}
+
+test("listSnapshots returns only real snapshots, oldest first", () => {
+  const dir = join(tempDir, "backups");
+  mkdirSync(dir, { recursive: true });
+  touch(dir, "pool-2026-01-03T00-00-00Z.db");
+  touch(dir, "pool-2026-01-01T00-00-00Z.db");
+  touch(dir, "pool-2026-01-02T00-00-00Z.db");
+  touch(dir, ".pool-2026-01-04T00-00-00Z.db.tmp"); // in-flight write
+  touch(dir, "pool-2026-01-05T00-00-00Z.db.rejected"); // failed verify
+  touch(dir, "notes.txt");
+
+  expect(listSnapshots(dir)).toEqual([
+    "pool-2026-01-01T00-00-00Z.db",
+    "pool-2026-01-02T00-00-00Z.db",
+    "pool-2026-01-03T00-00-00Z.db",
+  ]);
+  expect(newestSnapshot(dir)).toBe("pool-2026-01-03T00-00-00Z.db");
+});
+
+test("listSnapshots and newestSnapshot tolerate a missing directory", () => {
+  const dir = join(tempDir, "does-not-exist");
+  expect(listSnapshots(dir)).toEqual([]);
+  expect(newestSnapshot(dir)).toBeNull();
+});
+
+test("publish renames the temp file into place", () => {
+  seed(1);
+  const dir = join(tempDir, "backups");
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(dir, ".pool-2026-01-01T00-00-00Z.db.tmp");
+  const final = join(dir, "pool-2026-01-01T00-00-00Z.db");
+
+  snapshot(poolPath, tmp);
+  publish(tmp, final);
+
+  expect(existsSync(tmp)).toBe(false);
+  expect(existsSync(final)).toBe(true);
+  expect(countsOf(final).concept).toBe(1);
+});
+
+test("prune keeps exactly the newest N and never deletes the newest", () => {
+  const dir = join(tempDir, "backups");
+  mkdirSync(dir, { recursive: true });
+  for (const d of ["01", "02", "03", "04", "05"]) touch(dir, `pool-2026-01-${d}T00-00-00Z.db`);
+
+  const dropped = prune(dir, 2);
+
+  expect(dropped).toEqual([
+    "pool-2026-01-01T00-00-00Z.db",
+    "pool-2026-01-02T00-00-00Z.db",
+    "pool-2026-01-03T00-00-00Z.db",
+  ]);
+  expect(listSnapshots(dir)).toEqual([
+    "pool-2026-01-04T00-00-00Z.db",
+    "pool-2026-01-05T00-00-00Z.db",
+  ]);
+});
+
+test("prune is a no-op when there are fewer snapshots than the retention count", () => {
+  const dir = join(tempDir, "backups");
+  mkdirSync(dir, { recursive: true });
+  touch(dir, "pool-2026-01-01T00-00-00Z.db");
+  expect(prune(dir, 14)).toEqual([]);
+  expect(listSnapshots(dir).length).toBe(1);
+});
+
+test("prune refuses a retention count below 1", () => {
+  const dir = join(tempDir, "backups");
+  mkdirSync(dir, { recursive: true });
+  expect(() => prune(dir, 0)).toThrow(/keep must be >= 1/);
 });
