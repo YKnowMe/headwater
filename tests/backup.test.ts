@@ -29,6 +29,11 @@ import {
   newestSnapshot,
   publish,
   prune,
+  main,
+  resolveKeep,
+  resolveOffsiteDir,
+  previousCounts,
+  DEFAULT_KEEP,
 } from "../scripts/backup.ts";
 
 let tempDir: string;
@@ -54,9 +59,15 @@ beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "headwater-backup-"));
   poolPath = join(tempDir, "pool.db");
   db = initDb(poolPath);
+  process.env.HEADWATER_DATA_DIR = tempDir; // main() resolves the pool from this
+  delete process.env.HEADWATER_BACKUP_DIR;
+  delete process.env.HEADWATER_BACKUP_KEEP;
 });
 
 afterEach(() => {
+  delete process.env.HEADWATER_DATA_DIR;
+  delete process.env.HEADWATER_BACKUP_DIR;
+  delete process.env.HEADWATER_BACKUP_KEEP;
   db.close(); // release the handle before deleting (Windows locks open files)
   rmSync(tempDir, { recursive: true, force: true });
 });
@@ -233,4 +244,133 @@ test("prune refuses a retention count below 1", () => {
   const dir = join(tempDir, "backups");
   mkdirSync(dir, { recursive: true });
   expect(() => prune(dir, 0)).toThrow(/keep must be >= 1/);
+});
+
+/** An offsite dir whose PARENT exists — the shape main() requires. */
+function offsiteUnder(root: string): string {
+  mkdirSync(join(root, "cloud"), { recursive: true });
+  return join(root, "cloud", "headwater-backups");
+}
+
+test("resolveKeep honours a valid override and falls back otherwise", () => {
+  expect(resolveKeep()).toBe(DEFAULT_KEEP);
+  process.env.HEADWATER_BACKUP_KEEP = "3";
+  expect(resolveKeep()).toBe(3);
+  process.env.HEADWATER_BACKUP_KEEP = "0";
+  expect(resolveKeep()).toBe(DEFAULT_KEEP);
+  process.env.HEADWATER_BACKUP_KEEP = "banana";
+  expect(resolveKeep()).toBe(DEFAULT_KEEP);
+});
+
+test("resolveOffsiteDir honours HEADWATER_BACKUP_DIR", () => {
+  process.env.HEADWATER_BACKUP_DIR = "D:/somewhere/else";
+  expect(resolveOffsiteDir()).toBe("D:/somewhere/else");
+});
+
+test("main publishes to both destinations, leaves no .tmp, and exits 0", () => {
+  seed(3);
+  const offsite = offsiteUnder(tempDir);
+  process.env.HEADWATER_BACKUP_DIR = offsite;
+
+  expect(main(new Date("2026-07-09T05:19:53.560Z"))).toBe(0);
+
+  const local = join(tempDir, "backups");
+  expect(listSnapshots(local)).toEqual(["pool-2026-07-09T05-19-53Z.db"]);
+  expect(listSnapshots(offsite)).toEqual(["pool-2026-07-09T05-19-53Z.db"]);
+  expect(countsOf(join(offsite, "pool-2026-07-09T05-19-53Z.db")).concept).toBe(3);
+
+  for (const dir of [local, offsite]) {
+    expect(readdirSync(dir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+  }
+});
+
+test("main prunes both destinations to the retention count", () => {
+  seed(1);
+  const offsite = offsiteUnder(tempDir);
+  process.env.HEADWATER_BACKUP_DIR = offsite;
+  process.env.HEADWATER_BACKUP_KEEP = "2";
+
+  expect(main(new Date("2026-01-01T00:00:00Z"))).toBe(0);
+  expect(main(new Date("2026-01-02T00:00:00Z"))).toBe(0);
+  expect(main(new Date("2026-01-03T00:00:00Z"))).toBe(0);
+
+  expect(listSnapshots(join(tempDir, "backups"))).toEqual([
+    "pool-2026-01-02T00-00-00Z.db",
+    "pool-2026-01-03T00-00-00Z.db",
+  ]);
+  expect(listSnapshots(offsite)).toEqual([
+    "pool-2026-01-02T00-00-00Z.db",
+    "pool-2026-01-03T00-00-00Z.db",
+  ]);
+});
+
+test("main exits 1 and prunes nothing when the offsite parent is missing", () => {
+  seed(1);
+  process.env.HEADWATER_BACKUP_DIR = join(tempDir, "no-such-parent", "headwater-backups");
+  process.env.HEADWATER_BACKUP_KEEP = "1";
+
+  // A pre-existing REAL snapshot that a successful run WOULD have pruned (keep=1). It must be a real
+  // snapshot, not an empty file: main() reads it to get the previous counts for the tripwire.
+  const local = join(tempDir, "backups");
+  mkdirSync(local, { recursive: true });
+  snapshot(poolPath, join(local, "pool-2020-01-01T00-00-00Z.db"));
+
+  expect(main(new Date("2026-07-09T05:19:53.560Z"))).toBe(1);
+
+  // Local snapshot published, old one still there: a failed run prunes nothing.
+  expect(listSnapshots(local)).toEqual([
+    "pool-2020-01-01T00-00-00Z.db",
+    "pool-2026-07-09T05-19-53Z.db",
+  ]);
+});
+
+test("main rejects a snapshot whose counts shrank against the previous one", () => {
+  // Plant a "previous" snapshot with MORE rows than the live pool: the tripwire must fire.
+  const local = join(tempDir, "backups");
+  mkdirSync(local, { recursive: true });
+
+  const fatDir = mkdtempSync(join(tmpdir(), "headwater-fat-"));
+  const fatDb = initDb(join(fatDir, "pool.db"));
+  for (let i = 0; i < 5; i++) {
+    writeConcept(fatDb, { project: "p", type: "note", title: `t${i}`, body: "b", surface: SURFACE });
+  }
+  snapshot(join(fatDir, "pool.db"), join(local, "pool-2020-01-01T00-00-00Z.db"));
+  fatDb.close();
+  rmSync(fatDir, { recursive: true, force: true });
+
+  seed(3); // live pool has 3 < 5
+  process.env.HEADWATER_BACKUP_DIR = offsiteUnder(tempDir);
+
+  expect(main(new Date("2026-07-09T05:19:53.560Z"))).toBe(1);
+
+  // Nothing published, nothing pruned, the evidence kept.
+  expect(listSnapshots(local)).toEqual(["pool-2020-01-01T00-00-00Z.db"]);
+  expect(existsSync(join(local, "pool-2026-07-09T05-19-53Z.db.rejected"))).toBe(true);
+  expect(readdirSync(local).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+});
+
+test("previousCounts treats an unreadable predecessor as absent, and main still succeeds", () => {
+  seed(2);
+  const local = join(tempDir, "backups");
+  mkdirSync(local, { recursive: true });
+  touch(local, "pool-2020-01-01T00-00-00Z.db"); // 0 bytes: a damaged old backup
+
+  expect(previousCounts(local)).toBeNull(); // must not throw
+
+  // A damaged OLD backup must never stop today's backup from being taken.
+  process.env.HEADWATER_BACKUP_DIR = offsiteUnder(tempDir);
+  expect(main(new Date("2026-07-09T05:19:53.560Z"))).toBe(0);
+  expect(existsSync(join(local, "pool-2026-07-09T05-19-53Z.db"))).toBe(true);
+});
+
+test("main exits 1 when the pool does not exist", () => {
+  db.close();
+  rmSync(poolPath, { force: true });
+  rmSync(join(tempDir, "pool.db-wal"), { force: true });
+  rmSync(join(tempDir, "pool.db-shm"), { force: true });
+  process.env.HEADWATER_BACKUP_DIR = offsiteUnder(tempDir);
+
+  expect(main(new Date())).toBe(1);
+
+  db = initDb(poolPath); // afterEach closes it
 });

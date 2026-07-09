@@ -29,6 +29,7 @@
     "render": "bun run src/render.ts",
     "serve": "bun run src/render.ts serve",
     "test": "bun test",
+    "backup": "bun run scripts/backup.ts",
     "demo": "HEADWATER_DATA_DIR=.demo bun run scripts/seed-demo.ts",
     "demo:serve": "HEADWATER_DATA_DIR=.demo bun run src/render.ts serve"
   },

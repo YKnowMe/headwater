@@ -15,8 +15,10 @@
 // Run: `bun run backup`. Restore is a documented manual procedure — see README.
 
 import { Database } from "bun:sqlite";
-import { existsSync, readdirSync, renameSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { resolveDataDir, resolveDbPath } from "../src/db.ts";
 
 export const DEFAULT_KEEP = 14;
 
@@ -110,3 +112,94 @@ export function prune(dir: string, keep: number): string[] {
   for (const f of doomed) rmSync(join(dir, f), { force: true });
   return doomed;
 }
+
+/** Local history — lives beside the pool, under whatever HEADWATER_DATA_DIR resolves to. */
+export function resolveLocalBackupDir(): string {
+  return join(resolveDataDir(), "backups");
+}
+
+/** Offsite copy. Default is the operator's OneDrive; tests point this at a temp dir. */
+export function resolveOffsiteDir(): string {
+  const override = process.env.HEADWATER_BACKUP_DIR;
+  if (override && override.trim().length > 0) return override;
+  return join(homedir(), "OneDrive", "headwater-backups");
+}
+
+export function resolveKeep(): number {
+  const raw = process.env.HEADWATER_BACKUP_KEEP;
+  const n = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isInteger(n) && n >= 1 ? n : DEFAULT_KEEP;
+}
+
+/**
+ * Counts of the newest published snapshot — the tripwire's baseline. `null` when there is no
+ * predecessor, and ALSO when the predecessor cannot be read: a damaged old backup must never stop
+ * today's backup from being taken. We lose the shrink comparison for one run and say so; we do not
+ * lose the backup. `integrity_check` on the new snapshot is unaffected.
+ */
+export function previousCounts(dir: string): PoolCounts | null {
+  const prevName = newestSnapshot(dir);
+  if (!prevName) return null;
+  try {
+    return countsOf(join(dir, prevName));
+  } catch (err) {
+    console.error(`backup: cannot read previous snapshot ${prevName} (${(err as Error).message})`);
+    console.error(`backup: skipping the shrink check for this run`);
+    return null;
+  }
+}
+
+/** Exit code: 0 on success, 1 on any failure. A failed run publishes nothing new and prunes nothing. */
+export function main(now: Date = new Date()): number {
+  const src = resolveDbPath();
+  if (!existsSync(src)) {
+    console.error(`backup: no pool at ${src}`);
+    return 1;
+  }
+
+  const localDir = resolveLocalBackupDir();
+  mkdirSync(localDir, { recursive: true });
+
+  const prev = previousCounts(localDir);
+
+  const name = snapshotName(now);
+  const tmp = join(localDir, `.${name}.tmp`);
+  snapshot(src, tmp);
+
+  let counts: PoolCounts;
+  try {
+    counts = verify(tmp, prev);
+  } catch (err) {
+    const rejected = join(localDir, `${name}.rejected`);
+    renameSync(tmp, rejected);
+    console.error(`backup: REJECTED — ${(err as Error).message}`);
+    console.error(`backup: kept ${rejected} for inspection; pruned nothing`);
+    return 1;
+  }
+
+  const localFinal = join(localDir, name);
+  publish(tmp, localFinal);
+  console.error(
+    `backup: ${localFinal} (concepts=${counts.concept} lineage=${counts.lineage} handoffs=${counts.handoff})`,
+  );
+
+  // Offsite. Half of "both" is not "both": a missing destination is an error, not a warning.
+  const offsiteDir = resolveOffsiteDir();
+  const offsiteParent = dirname(offsiteDir);
+  if (!existsSync(offsiteParent)) {
+    console.error(`backup: offsite parent missing (${offsiteParent}) — local snapshot kept, pruned nothing`);
+    return 1;
+  }
+  mkdirSync(offsiteDir, { recursive: true });
+  const offsiteTmp = join(offsiteDir, `.${name}.tmp`);
+  copyFileSync(localFinal, offsiteTmp);
+  publish(offsiteTmp, join(offsiteDir, name));
+  console.error(`backup: ${join(offsiteDir, name)}`);
+
+  const keep = resolveKeep();
+  const dropped = [...prune(localDir, keep), ...prune(offsiteDir, keep)];
+  if (dropped.length > 0) console.error(`backup: pruned ${dropped.length} old snapshot(s), keeping ${keep}`);
+  return 0;
+}
+
+if (import.meta.main) process.exit(main());
