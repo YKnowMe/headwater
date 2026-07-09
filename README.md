@@ -56,6 +56,57 @@ One authoritative SQLite pool, stored **outside the repo**:
 
 The repo holds code only — the pool, `*.db`, and the generated `index.html` are git-ignored.
 
+### Backup and restore
+
+The pool is the only copy of your state and it lives outside the repo, so git does not protect it.
+
+```bash
+bun run backup
+```
+
+This takes a **consistent snapshot of the live pool** with `VACUUM INTO` over a read-only connection —
+safe to run while `bun run serve` and any MCP clients are attached. It verifies the snapshot
+(`PRAGMA integrity_check`, plus a check that the append-only tables never shrank), then writes
+timestamped copies to two places and prunes each to the newest 14:
+
+| Destination | Default | Protects against |
+| --- | --- | --- |
+| local history | `<data dir>/backups/` | a bad write, a botched merge |
+| offsite | `~/OneDrive/headwater-backups/` | a dead disk |
+
+Override the offsite directory with `HEADWATER_BACKUP_DIR` and the retention count with
+`HEADWATER_BACKUP_KEEP`. Any failure exits non-zero, publishes nothing new, and prunes nothing.
+
+> **Do not back up the pool with `cp pool.db`.** The pool is in WAL mode, so committed transactions sit
+> in `pool.db-wal` until a checkpoint. A file copy silently omits them — and the result still passes
+> `integrity_check`, so it looks fine until you need it.
+
+Run it daily with Task Scheduler:
+
+```
+schtasks /Create /TN "headwater-backup" /F /SC DAILY /ST 09:00 /RL LIMITED ^
+  /TR "\"%USERPROFILE%\.bun\bin\bun.exe\" run \"D:\Repository\headwater\scripts\backup.ts\""
+```
+
+If the machine is asleep at the scheduled time the run is skipped; `schtasks` cannot set *"run task as
+soon as possible after a missed start"*, so enable that once in the Task Scheduler GUI
+(task → Properties → Settings).
+
+#### Restoring
+
+A snapshot is a complete, standalone database, so restoring is a copy — with one footgun. **If a stale
+`pool.db-wal` is left beside the restored file, SQLite replays it on next open** and silently
+reintroduces the state you were trying to escape. Deleting the sidecars is not optional.
+
+1. Stop every writer: `bun run serve`, and every MCP client (Claude Code, Claude Desktop).
+2. Move the current pool aside: `mv ~/.workspace/pool.db ~/.workspace/pool.db.pre-restore`
+3. **Delete `~/.workspace/pool.db-wal` and `~/.workspace/pool.db-shm`.**
+4. Copy the chosen snapshot into place: `cp ~/.workspace/backups/pool-<stamp>.db ~/.workspace/pool.db`
+5. Verify: `bun -e 'const {Database}=require("bun:sqlite"); const d=new Database(process.env.HOME+"/.workspace/pool.db",{readonly:true}); console.log(d.query("PRAGMA integrity_check").get(), d.query("SELECT count(*) AS c FROM concept").get());'`
+6. Restart `serve` and your clients.
+
+This is deliberately manual: restore is rare, and step 1 is something no script can verify.
+
 ### Model (six tables)
 
 `project`, `surface`, `concept`, `lineage`, `handoff`, `handoff_concept`.

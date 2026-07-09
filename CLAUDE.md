@@ -52,6 +52,14 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
 - `vendor/mermaid.min.js` — the self-contained Mermaid **v11.15.0** UMD bundle (a vendored static asset,
   **not** an npm dep; MIT, notice in `vendor/mermaid.LICENSE`), served by the live viewer to render diagram
   blocks offline. The only vendored asset; do not add others without a recorded decision.
+- `scripts/backup.ts` — `bun run backup`: snapshot the pool with `VACUUM INTO` over a **read-only**
+  connection (a plain `cp` loses un-checkpointed WAL commits and the copy still passes
+  `integrity_check`), verify it (`integrity_check` + a monotonic row-count tripwire — the append-only
+  tables can never shrink), then publish timestamped copies to `<data dir>/backups/` and to
+  `$HEADWATER_BACKUP_DIR` (default `~/OneDrive/headwater-backups/`), pruning both to the newest 14.
+  Any failure publishes nothing new and prunes nothing. A recorded, operator-approved addition;
+  `tests/backup.test.ts` covers it. **Restore is a documented manual procedure (README) — never
+  scripted**, because its dangerous step (stop every writer) is one no script can verify.
 
 ## Data — one authoritative SQLite pool
 - Lives **outside the repo**: `~/.workspace/pool.db` by default, override with `HEADWATER_DATA_DIR`.
@@ -101,5 +109,5 @@ layers. No graph-viz library — **except** the one recorded carve-out above (a 
 
 ## Run
 - `bun run start` — MCP server (stdio). `bun run render` — write `index.html`. `bun run serve` — live viewer
-  with a Refresh button. `bun test` — tests.
+  with a Refresh button. `bun run backup` — verified pool snapshot → local history + offsite. `bun test` — tests.
 - stdio is the MCP channel: never write to **stdout** from the server; logs go to **stderr**.
