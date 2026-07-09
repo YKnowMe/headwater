@@ -94,6 +94,11 @@ If the machine is asleep at the scheduled time the run is skipped; `schtasks` ca
 soon as possible after a missed start"*, so enable that once in the Task Scheduler GUI
 (task → Properties → Settings).
 
+The tripwire assumes rows are only ever added — which the schema's append-only triggers enforce. If you
+ever perform sanctioned data surgery (dropping a trigger to delete rows), backups will reject every run
+until the larger old snapshots age out of the retention window. That is the tripwire working, not
+breaking; delete the stale snapshots to clear it.
+
 #### Restoring
 
 A snapshot is a complete, standalone database, so restoring is a copy — with one footgun. **If a stale

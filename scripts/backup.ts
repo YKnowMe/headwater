@@ -10,7 +10,7 @@
 // Verification: integrity_check, plus a monotonic row-count tripwire. Concepts are immutable and
 // lineage/handoff_concept are append-only (schema-v2 triggers reject every DELETE), so row counts can
 // never decrease between snapshots. A decrease means corruption, truncation, or the wrong source file.
-// On ANY failure we keep the rejected snapshot for inspection and prune nothing.
+// On a verify failure we keep the rejected snapshot for inspection. No failure path ever prunes.
 //
 // Run: `bun run backup`. Restore is a documented manual procedure — see README.
 
@@ -149,7 +149,12 @@ export function previousCounts(dir: string): PoolCounts | null {
   }
 }
 
-/** Exit code: 0 on success, 1 on any failure. A failed run publishes nothing new and prunes nothing. */
+/**
+ * Exit code: 0 on success, 1 on any failure. No failure path ever prunes.
+ * One failure path does still write: if the offsite parent is missing, the local snapshot has already
+ * been published by then — the operator keeps the history and learns from the non-zero exit that there
+ * is no offsite copy.
+ */
 export function main(now: Date = new Date()): number {
   const src = resolveDbPath();
   if (!existsSync(src)) {
