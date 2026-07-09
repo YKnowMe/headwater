@@ -129,8 +129,14 @@ signal that most SQLite backups cannot offer.
 | --- | --- |
 | `integrity_check` ≠ `ok` | keep tmp, no prune, exit 1 |
 | row count decreased vs. newest existing snapshot | keep tmp, no prune, exit 1 |
-| offsite dir missing/unwritable | local snapshot published, no offsite prune, exit 1 |
+| newest existing snapshot unreadable | warn, skip the shrink check, continue |
+| offsite dir missing/unwritable | local snapshot published, no prune, exit 1 |
 | source pool absent | exit 1, nothing written |
+
+The unreadable-predecessor case matters more than it looks: the tripwire's baseline is the previous
+snapshot, so a truncated or zero-length old backup would otherwise make the script *crash because an
+old backup is damaged* — exactly backwards. Treat it as "no predecessor", say so on stderr, and still
+take today's snapshot. `integrity_check` on the new snapshot is unaffected.
 
 Half of "both" is not "both": a missing offsite destination is an error, not a warning to swallow.
 Logs go to stderr.
