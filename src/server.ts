@@ -426,6 +426,8 @@ export function returnHandoff(
         `refusing to overwrite. The earlier return stands. If this note adds something, record it as a concept instead.`,
     );
   }
+  // Read-then-write races across processes land on the substrate trigger (a raw "one-way" abort
+  // instead of the friendly already_returned no-op). Rare, harmless — the note is never lost.
   db.query(
     `UPDATE handoff SET status = 'returned', returned_at = ?, return_note = ? WHERE id = ?`,
   ).run(nowIso(), args.return_note, args.handoff_id);
