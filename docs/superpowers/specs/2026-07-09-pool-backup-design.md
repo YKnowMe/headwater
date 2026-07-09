@@ -143,9 +143,10 @@ Logs go to stderr.
 
 ### Trigger
 
-```
-schtasks /Create /TN "headwater-backup" /F /SC DAILY /ST 09:00 /RL LIMITED ^
-  /TR "\"C:\Users\karim\.bun\bin\bun.exe\" run \"D:\Repository\headwater\scripts\backup.ts\""
+**In Command Prompt** (not PowerShell — `^` line continuation is cmd-only):
+
+```bat
+schtasks /Create /TN "headwater-backup" /F /SC DAILY /ST 09:00 /RL LIMITED /TR "C:\Users\karim\.bun\bin\bun.exe run D:\Repository\headwater\scripts\backup.ts"
 ```
 
 Invoked by absolute path so it does not depend on the working directory. `package.json` also gains

@@ -57,7 +57,8 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
   `integrity_check`), verify it (`integrity_check` + a monotonic row-count tripwire — the append-only
   tables can never shrink), then publish timestamped copies to `<data dir>/backups/` and to
   `$HEADWATER_BACKUP_DIR` (default `~/OneDrive/headwater-backups/`), pruning both to the newest 14.
-  Any failure publishes nothing new and prunes nothing. A recorded, operator-approved addition;
+  Any failure exits non-zero and prunes nothing (a missing offsite destination still publishes
+  locally). A recorded, operator-approved addition;
   `tests/backup.test.ts` covers it. **Restore is a documented manual procedure (README) — never
   scripted**, because its dangerous step (stop every writer) is one no script can verify.
 

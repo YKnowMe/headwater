@@ -75,17 +75,19 @@ timestamped copies to two places and prunes each to the newest 14:
 | offsite | `~/OneDrive/headwater-backups/` | a dead disk |
 
 Override the offsite directory with `HEADWATER_BACKUP_DIR` and the retention count with
-`HEADWATER_BACKUP_KEEP`. Any failure exits non-zero, publishes nothing new, and prunes nothing.
+`HEADWATER_BACKUP_KEEP`. Any failure exits non-zero and prunes nothing. One failure still writes: if
+the offsite destination is missing, the local snapshot is published anyway — you keep the history,
+you just have no offsite copy, and the non-zero exit tells you so.
 
 > **Do not back up the pool with `cp pool.db`.** The pool is in WAL mode, so committed transactions sit
 > in `pool.db-wal` until a checkpoint. A file copy silently omits them — and the result still passes
 > `integrity_check`, so it looks fine until you need it.
 
-Run it daily with Task Scheduler:
+Run it daily with Task Scheduler. **In Command Prompt** (not PowerShell — `%USERPROFILE%` is cmd-only
+expansion):
 
-```
-schtasks /Create /TN "headwater-backup" /F /SC DAILY /ST 09:00 /RL LIMITED ^
-  /TR "\"%USERPROFILE%\.bun\bin\bun.exe\" run \"D:\Repository\headwater\scripts\backup.ts\""
+```bat
+schtasks /Create /TN "headwater-backup" /F /SC DAILY /ST 09:00 /RL LIMITED /TR "%USERPROFILE%\.bun\bin\bun.exe run D:\Repository\headwater\scripts\backup.ts"
 ```
 
 If the machine is asleep at the scheduled time the run is skipped; `schtasks` cannot set *"run task as
@@ -98,11 +100,14 @@ A snapshot is a complete, standalone database, so restoring is a copy — with o
 `pool.db-wal` is left beside the restored file, SQLite replays it on next open** and silently
 reintroduces the state you were trying to escape. Deleting the sidecars is not optional.
 
+These steps assume the default data directory. If you set `HEADWATER_DATA_DIR`, substitute it for
+`~/.workspace` throughout.
+
 1. Stop every writer: `bun run serve`, and every MCP client (Claude Code, Claude Desktop).
 2. Move the current pool aside: `mv ~/.workspace/pool.db ~/.workspace/pool.db.pre-restore`
 3. **Delete `~/.workspace/pool.db-wal` and `~/.workspace/pool.db-shm`.**
 4. Copy the chosen snapshot into place: `cp ~/.workspace/backups/pool-<stamp>.db ~/.workspace/pool.db`
-5. Verify: `bun -e 'const {Database}=require("bun:sqlite"); const d=new Database(process.env.HOME+"/.workspace/pool.db",{readonly:true}); console.log(d.query("PRAGMA integrity_check").get(), d.query("SELECT count(*) AS c FROM concept").get());'`
+5. Verify: `bun -e "const {Database}=require('bun:sqlite'); const p=require('path').join(require('os').homedir(),'.workspace','pool.db'); const d=new Database(p,{readonly:true}); console.log(d.query('PRAGMA integrity_check').get(), d.query('SELECT count(*) AS c FROM concept').get()); d.close();"`
 6. Restart `serve` and your clients.
 
 This is deliberately manual: restore is rare, and step 1 is something no script can verify.
