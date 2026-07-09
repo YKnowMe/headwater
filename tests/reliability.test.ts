@@ -6,11 +6,19 @@
 
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initDb } from "../src/db.ts";
-import { writeConcept, openHandoff, returnHandoff, readProjectState, confirmHandoff } from "../src/server.ts";
+import {
+  writeConcept,
+  openHandoff,
+  returnHandoff,
+  readProjectState,
+  confirmHandoff,
+  callTool,
+  degradeProjectState,
+} from "../src/server.ts";
 import type { HandoffRow } from "../src/db.ts";
 
 let tempDir: string;
@@ -19,9 +27,13 @@ let db: Database;
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "headwater-rel-"));
   db = initDb(join(tempDir, "pool.db"));
+  process.env.HEADWATER_DATA_DIR = tempDir; // callTool logs to <data dir>/headwater.log
+  delete process.env.HEADWATER_MAX_RESPONSE_BYTES;
 });
 
 afterEach(() => {
+  delete process.env.HEADWATER_DATA_DIR;
+  delete process.env.HEADWATER_MAX_RESPONSE_BYTES;
   db.close(); // release the handle before deleting (Windows locks open files)
   rmSync(tempDir, { recursive: true, force: true });
 });
@@ -222,4 +234,99 @@ test("confirmHandoff is a slim confirmation: concept ids, no directive, no snaps
   const retry = returnHandoff(db, { handoff_id: h.id, return_note: "done" });
   expect(confirmHandoff(retry).already_returned).toBe(true);
   expect(confirmHandoff(r).returned_at).toBe(r.returned_at);
+});
+
+// --- callTool: the wire path — degrade guard + one log line per call -------------------------
+
+function readLogLines(): Array<Record<string, unknown>> {
+  const p = join(tempDir, "headwater.log");
+  if (!existsSync(p)) return [];
+  return readFileSync(p, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
+test("callTool answers like the plain function and logs exactly one parseable line", () => {
+  const res = callTool(db, "write_concept", {
+    project: "rel-test",
+    type: "note",
+    title: "via dispatcher",
+    body: "b",
+    surface: "test:rel",
+  });
+  expect(res.isError).toBeUndefined();
+  const echoed = JSON.parse(res.content[0]!.text) as { title: string };
+  expect(echoed.title).toBe("via dispatcher");
+
+  const lines = readLogLines();
+  expect(lines).toHaveLength(1);
+  const line = lines[0]!;
+  expect(line.op).toBe("write_concept");
+  expect(line.project).toBe("rel-test");
+  expect(line.ok).toBe(true);
+  expect(typeof line.ms).toBe("number");
+  expect(typeof line.req_bytes).toBe("number");
+  expect((line.resp_bytes as number)).toBe(res.content[0]!.text.length);
+  expect("degraded" in line).toBe(false);
+});
+
+test("a failing call logs ok:false with an error field and still returns isError", () => {
+  const res = callTool(db, "read_concept", { id: "no-such-concept" });
+  expect(res.isError).toBe(true);
+  const line = readLogLines()[0]!;
+  expect(line.op).toBe("read_concept");
+  expect(line.ok).toBe(false);
+  expect(String(line.error)).toContain("unknown concept");
+});
+
+test("an oversized state response degrades to ids+titles+counts instead of erroring", () => {
+  for (let i = 0; i < 5; i++) {
+    writeConcept(db, {
+      project: "rel-test",
+      type: "note",
+      title: `filler ${i}`,
+      body: "z".repeat(500),
+      surface: "test:rel",
+    });
+  }
+  process.env.HEADWATER_MAX_RESPONSE_BYTES = "1024"; // force the cap
+
+  const res = callTool(db, "read_project_state", { project: "rel-test" });
+  expect(res.isError).toBeUndefined(); // NEVER an error — an error at the cap is a total outage
+  const state = JSON.parse(res.content[0]!.text) as Record<string, unknown>;
+  expect(state.degraded).toBe(true);
+  expect(String(state.notice)).toContain("read_concept");
+  const heads = (state.concepts_by_status as Record<string, Array<Record<string, unknown>>>).active;
+  expect(heads.length).toBe(5);
+  expect(Object.keys(heads[0]!).sort()).toEqual(["id", "title"]);
+  expect(state.concept_counts).toEqual({ active: 5, locked: 0, parked: 0, resolved: 0, discarded: 0 });
+
+  const line = readLogLines().at(-1)!;
+  expect(line.degraded).toBe(true);
+});
+
+test("an under-cap state response has no degraded key and ships the full shape", () => {
+  writeConcept(db, { project: "rel-test", type: "note", title: "small", body: "b", surface: "test:rel" });
+  const res = callTool(db, "read_project_state", { project: "rel-test" });
+  const state = JSON.parse(res.content[0]!.text) as Record<string, unknown>;
+  expect("degraded" in state).toBe(false);
+  expect(
+    ((state.concepts_by_status as Record<string, Array<Record<string, unknown>>>).active[0]!)
+      .body_preview,
+  ).toBe("b");
+});
+
+test("a log-write failure never fails the request", () => {
+  process.env.HEADWATER_DATA_DIR = join(tempDir, "pool.db"); // a FILE, so <dir>/headwater.log is unwritable
+  const res = callTool(db, "read_concept", { id: "still-missing" });
+  expect(res.isError).toBe(true); // the tool error, not a logging crash
+  process.env.HEADWATER_DATA_DIR = tempDir;
+});
+
+test("unknown op is a clean isError, not a throw", () => {
+  const res = callTool(db, "no_such_tool", {});
+  expect(res.isError).toBe(true);
+  expect(res.content[0]!.text).toContain("unknown tool");
 });

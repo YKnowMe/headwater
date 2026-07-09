@@ -14,11 +14,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { Database } from "bun:sqlite";
+import { appendFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   initDb,
   genId,
   nowIso,
   slugify,
+  resolveDataDir,
   CONCEPT_TYPES,
   CONCEPT_STATUSES,
   LINEAGE_KINDS,
@@ -445,6 +448,141 @@ function fail(err: unknown): ToolResult {
   return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
 }
 
+/** Response-size cap for read_project_state. Read per call so tests can flip the env var. */
+function maxResponseBytes(): number {
+  const raw = process.env.HEADWATER_MAX_RESPONSE_BYTES;
+  const n = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isInteger(n) && n > 0 ? n : 131072;
+}
+
+/**
+ * The over-cap fallback: ids + titles + per-status counts. NEVER an error — an error at the cap
+ * would mean a client cannot cold-start at all, trading a heavy kickoff for no kickoff. The map
+ * degrades; recall stays first-class via read_concept(id).
+ */
+export function degradeProjectState(state: ProjectState): Record<string, unknown> {
+  const counts: Record<string, number> = {};
+  const heads: Record<string, Array<{ id: string; title: string }>> = {};
+  for (const [status, list] of Object.entries(state.concepts_by_status)) {
+    counts[status] = list.length;
+    heads[status] = list.map((c) => ({ id: c.id, title: c.title }));
+  }
+  return {
+    project: state.project,
+    exists: state.exists,
+    name: state.name,
+    degraded: true,
+    notice:
+      `response exceeded ${maxResponseBytes()} bytes; concepts and handoffs reduced to ids and titles. ` +
+      `Use read_concept(id) for full text.`,
+    concept_counts: counts,
+    concepts_by_status: heads,
+    open_handoffs: state.open_handoffs.map((h) => ({
+      id: h.id,
+      status: h.status,
+      to_surface_id: h.to_surface_id,
+    })),
+    recent_handoffs: state.recent_handoffs.map((h) => ({ id: h.id, status: h.status })),
+    recent_concepts: state.recent_concepts.map((c) => ({ id: c.id, title: c.title })),
+  };
+}
+
+/**
+ * One JSONL line per tool call, appended to <data dir>/headwater.log. A FILE, deliberately not
+ * stderr: the server writes stderr exactly once (startup), and logging every request into a pipe
+ * the client may never drain would fill the 64KB buffer, block console.error forever, and queue
+ * every later request behind it — creating the very wedge this instrumentation exists to hunt.
+ * Logging failures are swallowed: a lost log line must never fail a request.
+ */
+function logCall(
+  fields: { op: string; project?: string; degraded?: boolean },
+  args: unknown,
+  result: ToolResult,
+  t0: number,
+): void {
+  try {
+    const line = JSON.stringify({
+      ts: nowIso(),
+      op: fields.op,
+      ...(fields.project ? { project: fields.project } : {}),
+      ok: !result.isError,
+      ms: Math.round(performance.now() - t0),
+      req_bytes: JSON.stringify(args ?? {}).length,
+      resp_bytes: result.content[0]?.text.length ?? 0,
+      ...(fields.degraded ? { degraded: true } : {}),
+      ...(result.isError ? { error: result.content[0]?.text.slice(0, 300) } : {}),
+    });
+    appendFileSync(join(resolveDataDir(), "headwater.log"), line + "\n");
+  } catch {
+    // a lost log line never fails a request
+  }
+}
+
+/**
+ * The wire path for every tool: dispatch, degrade-guard (read_project_state only), one log line.
+ * registerTools wires each MCP tool straight to this, so tests exercise the exact path the client
+ * sees without any MCP plumbing.
+ */
+export function callTool(db: Database, op: string, args: unknown): ToolResult {
+  const t0 = performance.now();
+  let result: ToolResult;
+  let project: string | undefined;
+  let degraded = false;
+  try {
+    const a = args as never; // each case narrows via the tool functions' own arg types
+    switch (op) {
+      case "write_concept": {
+        const row = writeConcept(db, a);
+        project = row.project_id;
+        result = ok(row);
+        break;
+      }
+      case "fork_concept": {
+        const row = forkConcept(db, a);
+        project = row.project_id;
+        result = ok(row);
+        break;
+      }
+      case "read_concept": {
+        const row = readConcept(db, (args as { id: string }).id);
+        project = row.project_id;
+        result = ok(row);
+        break;
+      }
+      case "read_project_state": {
+        const state = readProjectState(db, (args as { project: string }).project);
+        project = state.project;
+        const text = JSON.stringify(state, null, 2);
+        if (text.length > maxResponseBytes()) {
+          degraded = true;
+          result = ok(degradeProjectState(state));
+        } else {
+          result = { content: [{ type: "text", text }] };
+        }
+        break;
+      }
+      case "open_handoff": {
+        const row = openHandoff(db, a);
+        project = row.project_id;
+        result = ok(confirmHandoff(row));
+        break;
+      }
+      case "return_handoff": {
+        const row = returnHandoff(db, a);
+        project = row.project_id;
+        result = ok(confirmHandoff(row));
+        break;
+      }
+      default:
+        throw new Error(`unknown tool: ${op}`);
+    }
+  } catch (err) {
+    result = fail(err);
+  }
+  logCall({ op, project, degraded }, args, result, t0);
+  return result;
+}
+
 /** Register all six tools on the given server, backed by the given pool. */
 export function registerTools(server: McpServer, db: Database): void {
   server.registerTool(
@@ -463,13 +601,7 @@ export function registerTools(server: McpServer, db: Database): void {
         surface: z.string().describe("Calling surface id or label (upserted)."),
       },
     },
-    async (args) => {
-      try {
-        return ok(writeConcept(db, args));
-      } catch (err) {
-        return fail(err);
-      }
-    },
+    async (args) => callTool(db, "write_concept", args),
   );
 
   server.registerTool(
@@ -494,13 +626,7 @@ export function registerTools(server: McpServer, db: Database): void {
         title: z.string().nullable().optional().describe("Title for the new node (defaults to parent's)."),
       },
     },
-    async (args) => {
-      try {
-        return ok(forkConcept(db, args));
-      } catch (err) {
-        return fail(err);
-      }
-    },
+    async (args) => callTool(db, "fork_concept", args),
   );
 
   server.registerTool(
@@ -512,13 +638,7 @@ export function registerTools(server: McpServer, db: Database): void {
         id: z.string().describe("Concept id."),
       },
     },
-    async (args) => {
-      try {
-        return ok(readConcept(db, args.id));
-      } catch (err) {
-        return fail(err);
-      }
-    },
+    async (args) => callTool(db, "read_concept", args),
   );
 
   server.registerTool(
@@ -533,13 +653,7 @@ export function registerTools(server: McpServer, db: Database): void {
         project: z.string().describe("Project id or name."),
       },
     },
-    async (args) => {
-      try {
-        return ok(readProjectState(db, args.project));
-      } catch (err) {
-        return fail(err);
-      }
-    },
+    async (args) => callTool(db, "read_project_state", args),
   );
 
   server.registerTool(
@@ -558,13 +672,7 @@ export function registerTools(server: McpServer, db: Database): void {
         directive: z.string().describe("What the receiving surface should do."),
       },
     },
-    async (args) => {
-      try {
-        return ok(confirmHandoff(openHandoff(db, args)));
-      } catch (err) {
-        return fail(err);
-      }
-    },
+    async (args) => callTool(db, "open_handoff", args),
   );
 
   server.registerTool(
@@ -577,13 +685,7 @@ export function registerTools(server: McpServer, db: Database): void {
         return_note: z.string().describe("What the receiver reports back."),
       },
     },
-    async (args) => {
-      try {
-        return ok(confirmHandoff(returnHandoff(db, args)));
-      } catch (err) {
-        return fail(err);
-      }
-    },
+    async (args) => callTool(db, "return_handoff", args),
   );
 }
 
