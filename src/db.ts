@@ -209,15 +209,25 @@ function schemaSql(): string {
     CREATE TRIGGER IF NOT EXISTS handoff_no_delete
       BEFORE DELETE ON handoff
       BEGIN SELECT RAISE(ABORT, 'handoff is immutable: never DELETE a handoff'); END;
+
+    -- v3: the only status transition that exists is pending -> returned, enforced here so even a
+    -- raw sqlite3 edit cannot clobber a stored return (a retried return_handoff nearly erased a
+    -- client's return note — the tool now short-circuits, this is the backstop). Revising this
+    -- trigger to admit 'consumed'/'dropped' is a recorded, deliberate act, like all data surgery.
+    CREATE TRIGGER IF NOT EXISTS handoff_return_is_one_way
+      BEFORE UPDATE ON handoff
+      WHEN OLD.status <> 'pending' OR NEW.status <> 'returned'
+      BEGIN SELECT RAISE(ABORT, 'handoff return is one-way: only pending -> returned'); END;
   `;
 }
 
 // --- Connection / init ------------------------------------------------------
 
-/** Bump when the schema changes. Gates one-time DDL via PRAGMA user_version. v2 adds the immutability
- *  triggers; because schemaSql() uses IF NOT EXISTS throughout, an existing v1 pool gains them on its
- *  next open (re-running the DDL is a no-op for the tables/indexes and just creates the new triggers). */
-const SCHEMA_VERSION = 2;
+/** Bump when the schema changes. Gates one-time DDL via PRAGMA user_version. v2 added the immutability
+ *  triggers; v3 adds handoff_return_is_one_way. Because schemaSql() uses IF NOT EXISTS throughout, an
+ *  existing older pool gains the new objects on its next open (re-running the DDL is a no-op for
+ *  everything that already exists). */
+const SCHEMA_VERSION = 3;
 
 /**
  * Create the schema exactly once per pool, atomically. The pool is shared across processes (one MCP

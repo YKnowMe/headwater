@@ -339,10 +339,26 @@ export function openHandoff(db: Database, args: OpenHandoffArgs): HandoffRow {
   return getHandoff(db, id)!;
 }
 
-/** Move a handoff to `returned`, stamping returned_at and the return note. */
-export function returnHandoff(db: Database, args: ReturnHandoffArgs): HandoffRow {
+/**
+ * Move a handoff to `returned`, stamping returned_at and the return note. Retry-safe: a repeat call
+ * with the IDENTICAL note is a no-op returning the stored row (flagged already_returned) — no UPDATE
+ * is issued; a repeat with a DIFFERENT note is refused, naming the stored returned_at so a client
+ * that never saw its first response knows the write landed. The schema-v3 trigger backstops this at
+ * the substrate. Never overwrite: a retry after a hang was silently erasing the stored note.
+ */
+export function returnHandoff(
+  db: Database,
+  args: ReturnHandoffArgs,
+): HandoffRow & { already_returned?: boolean } {
   const existing = getHandoff(db, args.handoff_id);
   if (!existing) throw new Error(`unknown handoff: ${args.handoff_id}`);
+  if (existing.status !== "pending") {
+    if (existing.return_note === args.return_note) return { ...existing, already_returned: true };
+    throw new Error(
+      `handoff ${args.handoff_id} was already returned at ${existing.returned_at} with a different note; ` +
+        `refusing to overwrite. The earlier return stands. If this note adds something, record it as a concept instead.`,
+    );
+  }
   db.query(
     `UPDATE handoff SET status = 'returned', returned_at = ?, return_note = ? WHERE id = ?`,
   ).run(nowIso(), args.return_note, args.handoff_id);
