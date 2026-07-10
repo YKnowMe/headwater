@@ -21,6 +21,8 @@ import {
   readHandoff,
   findConcepts,
   forkConcept,
+  leanProjectState,
+  idsProjectState,
 } from "../src/server.ts";
 import type { HandoffRow } from "../src/db.ts";
 
@@ -296,7 +298,7 @@ test("an oversized state response degrades to ids+titles+counts instead of error
   }
   process.env.HEADWATER_MAX_RESPONSE_BYTES = "1024"; // force the cap
 
-  const res = callTool(db, "read_project_state", { project: "rel-test" });
+  const res = callTool(db, "read_project_state", { project: "rel-test", mode: "full" });
   expect(res.isError).toBeUndefined(); // NEVER an error — an error at the cap is a total outage
   const state = JSON.parse(res.content[0]!.text) as Record<string, unknown>;
   expect(state.degraded).toBe(true);
@@ -311,7 +313,7 @@ test("an oversized state response degrades to ids+titles+counts instead of error
 });
 
 test("an under-cap state response has no degraded key and ships the full shape", () => {
-  writeConcept(db, { project: "rel-test", type: "note", title: "small", body: "b", surface: "test:rel" });
+  writeConcept(db, { project: "rel-test", type: "decision", title: "small", body: "b", surface: "test:rel" });
   const res = callTool(db, "read_project_state", { project: "rel-test" });
   const state = JSON.parse(res.content[0]!.text) as Record<string, unknown>;
   expect("degraded" in state).toBe(false);
@@ -551,3 +553,86 @@ test("find_concepts through callTool logs with the project", () => {
   expect(res.isError).toBeUndefined();
   expect(readLogLines().at(-1)!.op).toBe("find_concepts");
 });
+
+// --- Spec B: state modes — lean default, full byte-identical, ids minimal ---------------------
+
+/** One durable + one chatty concept in each of active and (derived) resolved. */
+function seedModes(): void {
+  writeConcept(db, { project: "rel-test", type: "decision", title: "durable active", body: "why it was decided ".repeat(30), surface: "s" });
+  writeConcept(db, { project: "rel-test", type: "note", title: "chatty active", body: "routine chatter ".repeat(30), surface: "s" });
+  const q = writeConcept(db, { project: "rel-test", type: "open_question", title: "old question", body: "asked", surface: "s" });
+  forkConcept(db, { parent_id: q.id, body: "settled", surface: "s", type: "decision", kind: "forks_from" });
+}
+
+test("default mode is lean: durable types keep previews, notes and the archive become heads", () => {
+  seedModes();
+  const res = callTool(db, "read_project_state", { project: "rel-test" }); // no mode arg
+  expect(res.isError).toBeUndefined();
+  expect(res.content[0]!.text.includes('\n  "')).toBe(false); // compact, not pretty
+  const st = JSON.parse(res.content[0]!.text) as any;
+
+  const active = st.concepts_by_status.active as Array<Record<string, unknown>>;
+  const durable = active.find((c) => c.title === "durable active")!;
+  const chatty = active.find((c) => c.title === "chatty active")!;
+  expect("body_preview" in durable).toBe(true);
+  expect("body_preview" in chatty).toBe(false); // head only
+  expect(Object.keys(chatty).sort()).toEqual(["created_at", "id", "status", "title", "type"]);
+
+  const resolved = st.concepts_by_status.resolved as Array<Record<string, unknown>>;
+  const closedQ = resolved.find((c) => c.title === "old question")!;
+  expect("body_preview" in closedQ).toBe(false);
+  expect(closedQ.closed_by).toBeDefined(); // heads keep closure visible
+});
+
+test("mode:'full' is byte-identical to the pretty serialization of readProjectState", () => {
+  seedModes();
+  const res = callTool(db, "read_project_state", { project: "rel-test", mode: "full" });
+  expect(res.content[0]!.text).toBe(JSON.stringify(readProjectState(db, "rel-test"), null, 2));
+});
+
+test("mode:'ids' is heads everywhere plus per-status counts, compact", () => {
+  seedModes();
+  const res = callTool(db, "read_project_state", { project: "rel-test", mode: "ids" });
+  const st = JSON.parse(res.content[0]!.text) as any;
+  // active = durable + chatty + the closing decision fork (a fork is a NEW active concept)
+  expect(st.concept_counts.active).toBe(3);
+  expect(st.concept_counts.resolved).toBe(1); // the derived-closed open_question
+  const all = Object.values(st.concepts_by_status).flat() as Array<Record<string, unknown>>;
+  expect(all.every((c) => !("body_preview" in c))).toBe(true);
+  expect(res.content[0]!.text.includes('\n  "')).toBe(false);
+});
+
+test("the degrade guard still fires in lean mode", () => {
+  for (let i = 0; i < 5; i++) {
+    writeConcept(db, { project: "rel-test", type: "decision", title: `big ${i}`, body: "z".repeat(500), surface: "s" });
+  }
+  process.env.HEADWATER_MAX_RESPONSE_BYTES = "1024";
+  const res = callTool(db, "read_project_state", { project: "rel-test" });
+  expect(res.isError).toBeUndefined();
+  expect((JSON.parse(res.content[0]!.text) as any).degraded).toBe(true);
+});
+
+test("lean at 10x scale stays under 2s and under the cap (realistic open-loop count)", () => {
+  // seedTenX leaves 25 heavy pending handoffs — unrealistic (real projects close their loops), and
+  // open_handoffs deliberately carries WHOLE directives, so that fixture exceeds the cap on pending
+  // weight alone before concepts contribute a byte. Lean's claim is about CONCEPT growth; assert it
+  // against the same 600-concept load with a realistic 2 open loops. (A project hoarding ~25 heavy
+  // open loops WILL degrade its kickoff — that is the designed behavior, not a bug.)
+  const ids: string[] = [];
+  for (let i = 0; i < 600; i++) {
+    ids.push(writeConcept(db, { project: "scale-lean", type: "note", title: `concept ${i}`,
+      body: `body ${i} ` + "x".repeat(600), surface: "test:scale" }).id);
+  }
+  for (let i = 0; i < 50; i++) {
+    const h = openHandoff(db, { project: "scale-lean", from_surface: "test:a", to_surface: "test:b",
+      concept_ids: [ids[i % ids.length]!], directive: `directive ${i} ` + "d".repeat(5_000) });
+    if (i < 48) returnHandoff(db, { handoff_id: h.id, return_note: `note ${i} ` + "n".repeat(2_000) });
+  }
+  const t0 = performance.now();
+  const res = callTool(db, "read_project_state", { project: "scale-lean" });
+  const ms = performance.now() - t0;
+  expect(res.isError).toBeUndefined();
+  expect(ms).toBeLessThan(2_000);
+  expect((JSON.parse(res.content[0]!.text) as any).degraded).toBeUndefined();
+  console.error(`[scale] lean at 10x: ${Math.round(ms)}ms, ${res.content[0]!.text.length} bytes`);
+}, 30_000);

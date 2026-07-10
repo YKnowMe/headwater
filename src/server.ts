@@ -523,6 +523,43 @@ export function degradeProjectState(state: ProjectState): Record<string, unknown
   };
 }
 
+/** Types whose kickoff previews earn their bytes — the capture protocol's own "worth remembering" set. */
+const DURABLE_TYPES: ReadonlySet<string> = new Set(["decision", "architecture", "constraint", "open_question"]);
+
+function toHead(c: ConceptSummary): ConceptHead {
+  return {
+    id: c.id, type: c.type, title: c.title, status: c.status, created_at: c.created_at,
+    ...(c.closed_by ? { closed_by: c.closed_by } : {}),
+  };
+}
+
+/**
+ * The lean kickoff (default): previews for durable-type working-set concepts, heads for note/feature
+ * chatter and the whole archive. Measured on the heaviest live project: 82.2 -> 55.9 KB, and note
+ * traffic (the chattiest class) stops growing the payload. Handoff/recents sections ride unchanged.
+ */
+export function leanProjectState(state: ProjectState): Record<string, unknown> {
+  const shaped: Record<string, unknown> = {};
+  for (const [status, list] of Object.entries(state.concepts_by_status)) {
+    shaped[status] =
+      status === "resolved" || status === "discarded"
+        ? list.map(toHead)
+        : list.map((c) => (DURABLE_TYPES.has(c.type) ? c : toHead(c)));
+  }
+  return { ...state, mode: "lean", concepts_by_status: shaped };
+}
+
+/** Minimal kickoff: heads everywhere + per-status counts. */
+export function idsProjectState(state: ProjectState): Record<string, unknown> {
+  const counts: Record<string, number> = {};
+  const shaped: Record<string, unknown> = {};
+  for (const [status, list] of Object.entries(state.concepts_by_status)) {
+    counts[status] = list.length;
+    shaped[status] = list.map(toHead);
+  }
+  return { ...state, mode: "ids", concept_counts: counts, concepts_by_status: shaped };
+}
+
 /**
  * One JSONL line per tool call, appended to <data dir>/headwater.log. A FILE, deliberately not
  * stderr: the server writes stderr exactly once (startup), and logging every request into a pipe
@@ -598,9 +635,16 @@ export function callTool(db: Database, op: string, args: unknown): ToolResult {
         break;
       }
       case "read_project_state": {
-        const state = readProjectState(db, (args as { project: string }).project);
+        const a3 = args as { project: string; mode?: "full" | "lean" | "ids" };
+        const state = readProjectState(db, a3.project);
         project = state.project;
-        const text = JSON.stringify(state, null, 2);
+        const mode = a3.mode ?? "lean";
+        // full stays pretty and byte-identical to the pre-mode output — the back-compat guarantee.
+        // lean/ids are compact: an LLM client pays per byte and gains nothing from indentation.
+        const text =
+          mode === "full"
+            ? JSON.stringify(state, null, 2)
+            : JSON.stringify(mode === "lean" ? leanProjectState(state) : idsProjectState(state));
         if (text.length > maxResponseBytes()) {
           degraded = true;
           result = ok(degradeProjectState(state));
@@ -725,9 +769,18 @@ export function registerTools(server: McpServer, db: Database): void {
       description:
         "Session-kickoff context for a project: concepts grouped by status, open (pending) handoffs, " +
         "and recent handoffs and concepts. Concept bodies arrive as bounded previews (body_preview) — " +
-        "call read_concept(id) for any full body you need.",
+        "call read_concept(id) for any full body you need. Default mode is lean — use " +
+        "find_concepts/read_concept for anything it elides; mode:'full' only when you truly need every " +
+        "preview.",
       inputSchema: {
         project: z.string().describe("Project id or name."),
+        mode: z
+          .enum(["full", "lean", "ids"])
+          .default("lean")
+          .describe(
+            "lean (default): durable-type previews + heads for notes and the archive. " +
+              "full: everything with previews (heaviest). ids: heads + counts only.",
+          ),
       },
     },
     async (args) => callTool(db, "read_project_state", args),
