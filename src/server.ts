@@ -644,7 +644,7 @@ export function callTool(db: Database, op: string, args: unknown): ToolResult {
         const text =
           mode === "full"
             ? JSON.stringify(state, null, 2)
-            : JSON.stringify(mode === "lean" ? leanProjectState(state) : idsProjectState(state));
+            : JSON.stringify(mode === "ids" ? idsProjectState(state) : leanProjectState(state));
         if (text.length > maxResponseBytes()) {
           degraded = true;
           result = ok(degradeProjectState(state));
@@ -768,10 +768,8 @@ export function registerTools(server: McpServer, db: Database): void {
       title: "Read project state",
       description:
         "Session-kickoff context for a project: concepts grouped by status, open (pending) handoffs, " +
-        "and recent handoffs and concepts. Concept bodies arrive as bounded previews (body_preview) — " +
-        "call read_concept(id) for any full body you need. Default mode is lean — use " +
-        "find_concepts/read_concept for anything it elides; mode:'full' only when you truly need every " +
-        "preview.",
+        "and recent handoffs and concepts. In the default lean mode, decisions/architecture/constraints/open questions arrive with bounded previews (body_preview) and other concepts as heads — call read_concept(id) for any full body, or mode:'full' for previews of everything. Default mode is lean — use " +
+        "find_concepts/read_concept for anything it elides; mode:'ids' is the minimal map.",
       inputSchema: {
         project: z.string().describe("Project id or name."),
         mode: z

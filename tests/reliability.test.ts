@@ -570,6 +570,7 @@ test("default mode is lean: durable types keep previews, notes and the archive b
   expect(res.isError).toBeUndefined();
   expect(res.content[0]!.text.includes('\n  "')).toBe(false); // compact, not pretty
   const st = JSON.parse(res.content[0]!.text) as any;
+  expect(st.mode).toBe("lean");
 
   const active = st.concepts_by_status.active as Array<Record<string, unknown>>;
   const durable = active.find((c) => c.title === "durable active")!;
@@ -594,6 +595,7 @@ test("mode:'ids' is heads everywhere plus per-status counts, compact", () => {
   seedModes();
   const res = callTool(db, "read_project_state", { project: "rel-test", mode: "ids" });
   const st = JSON.parse(res.content[0]!.text) as any;
+  expect(st.mode).toBe("ids");
   // active = durable + chatty + the closing decision fork (a fork is a NEW active concept)
   expect(st.concept_counts.active).toBe(3);
   expect(st.concept_counts.resolved).toBe(1); // the derived-closed open_question
