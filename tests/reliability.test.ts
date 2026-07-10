@@ -18,6 +18,9 @@ import {
   confirmHandoff,
   callTool,
   degradeProjectState,
+  readHandoff,
+  findConcepts,
+  forkConcept,
 } from "../src/server.ts";
 import type { HandoffRow } from "../src/db.ts";
 
@@ -469,3 +472,82 @@ test("wedge soak: heavy read -> immediate return_handoff over real stdio, repeat
     db = initDb(join(tempDir, "pool.db")); // afterEach closes db; reopen so it has one to close
   }
 }, 60_000);
+
+// --- Spec B: discovery — read_handoff + find_concepts ----------------------------------------
+
+test("read_handoff recalls the full frozen snapshot — bodies whole, directive whole", () => {
+  const long = "frozen-head " + "f".repeat(2000) + " frozen-tail";
+  const c = writeConcept(db, { project: "rel-test", type: "note", title: "cargo", body: long, surface: "test:rel" });
+  const h = openHandoff(db, {
+    project: "rel-test", from_surface: "test:a", to_surface: "test:b",
+    concept_ids: [c.id], directive: "act on the whole thing",
+  });
+  returnHandoff(db, { handoff_id: h.id, return_note: "done in full" });
+
+  const got = readHandoff(db, h.id) as Record<string, unknown>;
+  expect(got.id).toBe(h.id);
+  expect(got.directive).toBe("act on the whole thing"); // whole, not previewed
+  expect(got.return_note).toBe("done in full");
+  const snap = got.payload_snapshot as Array<Record<string, unknown>>;
+  expect(snap[0]!.body).toBe(long); // FULL frozen body — this IS the recall path
+});
+
+test("read_handoff throws on an unknown id", () => {
+  expect(() => readHandoff(db, "no-such-handoff")).toThrow(/unknown handoff/);
+});
+
+test("read_handoff through callTool answers and logs", () => {
+  const h = seedHandoff();
+  const res = callTool(db, "read_handoff", { id: h.id });
+  expect(res.isError).toBeUndefined();
+  expect((JSON.parse(res.content[0]!.text) as { id: string }).id).toBe(h.id);
+  const line = readLogLines().at(-1)!;
+  expect(line.op).toBe("read_handoff");
+  expect(line.project).toBe("rel-test");
+});
+
+test("find_concepts matches title and body, newest first, project-scoped", () => {
+  writeConcept(db, { project: "rel-test", type: "note", title: "alpha zebra", body: "plain", surface: "s" });
+  writeConcept(db, { project: "rel-test", type: "note", title: "beta", body: "the zebra hides here", surface: "s" });
+  writeConcept(db, { project: "other-project", type: "note", title: "zebra elsewhere", body: "x", surface: "s" });
+
+  const hits = findConcepts(db, { project: "rel-test", query: "zebra" });
+  expect(hits).toHaveLength(2);
+  expect(hits[0]!.title).toBe("beta"); // newest first
+  expect(hits.every((h) => h.project_id === "rel-test")).toBe(true);
+  expect("body_preview" in hits[0]!).toBe(true); // summaries, not full bodies
+  expect("body" in hits[0]!).toBe(false);
+});
+
+test("find_concepts treats % and _ literally", () => {
+  writeConcept(db, { project: "rel-test", type: "note", title: "has 100% coverage", body: "b", surface: "s" });
+  writeConcept(db, { project: "rel-test", type: "note", title: "plain title", body: "b", surface: "s" });
+  expect(findConcepts(db, { project: "rel-test", query: "100%" })).toHaveLength(1);
+  expect(findConcepts(db, { project: "rel-test", query: "%" })).toHaveLength(1); // literal %, not match-all
+  expect(findConcepts(db, { project: "rel-test", query: "a_n" })).toHaveLength(0); // _ is literal too
+});
+
+test("find_concepts rejects an empty query and clamps limit", () => {
+  expect(() => findConcepts(db, { project: "rel-test", query: "   " })).toThrow(/non-empty query/);
+  for (let i = 0; i < 5; i++) {
+    writeConcept(db, { project: "rel-test", type: "note", title: `bulk ${i}`, body: "same-token", surface: "s" });
+  }
+  expect(findConcepts(db, { project: "rel-test", query: "same-token", limit: 2 })).toHaveLength(2);
+  expect(findConcepts(db, { project: "rel-test", query: "same-token", limit: 0 })).toHaveLength(1); // clamped to 1
+  expect(findConcepts(db, { project: "rel-test", query: "same-token", limit: 999 })).toHaveLength(5); // clamp to 100 > 5
+});
+
+test("find_concepts carries closed_by on a derived-closed hit", () => {
+  const q = writeConcept(db, { project: "rel-test", type: "open_question", title: "findable question", body: "q-token", surface: "s" });
+  const d = forkConcept(db, { parent_id: q.id, body: "answered", surface: "s", type: "decision", kind: "forks_from" });
+  const hits = findConcepts(db, { project: "rel-test", query: "q-token" });
+  const hit = hits.find((h) => h.id === q.id)!;
+  expect(hit.closed_by).toEqual({ concept_id: d.id, via: "decision" });
+});
+
+test("find_concepts through callTool logs with the project", () => {
+  writeConcept(db, { project: "rel-test", type: "note", title: "loggable", body: "b", surface: "s" });
+  const res = callTool(db, "find_concepts", { project: "rel-test", query: "loggable" });
+  expect(res.isError).toBeUndefined();
+  expect(readLogLines().at(-1)!.op).toBe("find_concepts");
+});

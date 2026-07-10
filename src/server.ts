@@ -303,6 +303,40 @@ export function readConcept(db: Database, id: string): ConceptRow {
   return concept;
 }
 
+/** Recall a single handoff by id — the archive path. Snapshot bodies arrive WHOLE: read_project_state
+ *  previews returned handoffs, so this is where full recall lives (mirrors read_concept). */
+export function readHandoff(db: Database, id: string): Record<string, unknown> {
+  const row = getHandoff(db, id);
+  if (!row) throw new Error(`unknown handoff: ${id}`);
+  return presentHandoff(row);
+}
+
+/** Substring search over title+body — plain LIKE, the viewer's ?q= primitive; deliberately not FTS.
+ *  Returns kickoff-style summaries (body_preview + closed_by): enough to pick a read_concept target. */
+export function findConcepts(
+  db: Database,
+  args: { project: string; query: string; limit?: number },
+): ConceptSummary[] {
+  const q = args.query.trim();
+  if (q.length === 0) throw new Error("find_concepts requires a non-empty query");
+  const limit = Math.min(100, Math.max(1, Math.trunc(args.limit ?? 20)));
+  const pattern = `%${q.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
+  const rows = db
+    .query<ConceptRow, [string, string, string, number]>(
+      `SELECT * FROM concept
+        WHERE project_id = ? AND (title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')
+        ORDER BY created_at DESC LIMIT ?`,
+    )
+    .all(slugify(args.project), pattern, pattern, limit);
+  const closures = computeClosures(db);
+  return rows.map((c) => {
+    const s = summarize(c);
+    const cb = closures.get(c.id);
+    if (cb) s.closed_by = cb;
+    return s;
+  });
+}
+
 /** Session-kickoff context: concepts grouped by status, pending handoffs, and recents. */
 export function readProjectState(db: Database, project: string): ProjectState {
   const projectId = slugify(project);
@@ -551,6 +585,18 @@ export function callTool(db: Database, op: string, args: unknown): ToolResult {
         result = ok(row);
         break;
       }
+      case "read_handoff": {
+        const row = readHandoff(db, (args as { id: string }).id);
+        project = row.project_id as string;
+        result = ok(row);
+        break;
+      }
+      case "find_concepts": {
+        const a2 = args as { project: string; query: string; limit?: number };
+        project = slugify(a2.project);
+        result = ok(findConcepts(db, a2));
+        break;
+      }
       case "read_project_state": {
         const state = readProjectState(db, (args as { project: string }).project);
         project = state.project;
@@ -641,6 +687,35 @@ export function registerTools(server: McpServer, db: Database): void {
       },
     },
     async (args) => callTool(db, "read_concept", args),
+  );
+
+  server.registerTool(
+    "read_handoff",
+    {
+      title: "Read handoff",
+      description:
+        "Recall a single handoff by id — full directive, return note, and the frozen payload snapshot " +
+        "with complete concept bodies. read_project_state previews returned handoffs; this is full recall.",
+      inputSchema: { id: z.string().describe("Handoff id.") },
+    },
+    async (args) => callTool(db, "read_handoff", args),
+  );
+
+  server.registerTool(
+    "find_concepts",
+    {
+      title: "Find concepts",
+      description:
+        "Substring search over concept titles and bodies within a project (plain match — % and _ are " +
+        "literal). Returns summaries with body_preview and closed_by, newest first. Search first; only " +
+        "read_project_state(mode:'full') when you truly need everything.",
+      inputSchema: {
+        project: z.string().describe("Project id or name."),
+        query: z.string().describe("Substring to find in title or body."),
+        limit: z.number().int().optional().describe("Max results, 1-100 (default 20)."),
+      },
+    },
+    async (args) => callTool(db, "find_concepts", args),
   );
 
   server.registerTool(
