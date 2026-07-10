@@ -132,7 +132,7 @@ handoff's `payload_snapshot` + `directive` are **frozen at creation** (only its 
 These are enforced **at the substrate** by SQLite triggers — a raw `sqlite3 pool.db "UPDATE …"` is rejected
 too, not just the tool paths — so the integrity claim holds of the file itself.
 
-## MCP tools (six)
+## MCP tools (eight)
 
 | Tool | What it does |
 | --- | --- |
@@ -140,8 +140,12 @@ too, not just the tool paths — so the integrity claim holds of the file itself
 | `fork_concept` | Create a new concept from a parent + a lineage edge new→parent. Original untouched. |
 | `read_concept` | Recall a concept by id (first-class path). |
 | `read_project_state` | Session-kickoff context: concepts by status, pending handoffs, recents. |
+| `read_handoff` | Recall a handoff by id — full directive, return note, and frozen snapshot with complete bodies. |
+| `find_concepts` | Substring search across project titles and bodies; returns newest-first summaries. |
 | `open_handoff` | Open a `pending` handoff carrying named concepts (frozen JSON snapshot). |
 | `return_handoff` | Mark a handoff `returned` with a return note. |
+
+`read_project_state` defaults to a lean kickoff (durable-type previews; heads for the rest) — `find_concepts` and `read_handoff`/`read_concept` recall anything it elides.
 
 ## Usage
 

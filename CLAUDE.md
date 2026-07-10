@@ -81,7 +81,12 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
     the return transition — so a raw `sqlite3` edit fails too, not just the tool paths. Operator data
     surgery must drop the relevant trigger first (and is itself a recorded, deliberate act).
 
-## The six MCP tools
+## The eight MCP tools
+
+*(Grown from six by a recorded, operator-approved amendment (2026-07-10): `read_handoff` and
+`find_concepts` close the discovery gap that caused a live coordination outage. `find_concepts` is
+plain SQL `LIKE` — the no-FTS fence below still stands.)*
+
 - `write_concept(project, type, title, body, status="active", surface)` → new immutable concept.
 - `fork_concept(parent_id, body, surface, kind="forks_from", reason=None, type="note", title=None)`
   → new concept (same project as parent) + a lineage edge new→parent. Original untouched.
@@ -94,12 +99,22 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
   supersedes answers an `open_question`; annotates/relates_to/depends_on never close) — a derived-closed
   concept presents under `resolved` with `closed_by`, its stored status untouched. The viewer groups and
   badges the same way. Do not add a status-update path; this is the settled alternative.
+  Takes `mode: full | lean | ids` (default **lean**: previews for durable types — decision/
+  architecture/constraint/open_question — heads for note/feature and the archive, compact JSON;
+  measured 82→56 KB on the heaviest project). `full` is the pre-mode shape, pretty-printed,
+  byte-identical. `ids` is heads + per-status counts.
   Pending handoffs arrive once (in `open_handoffs`, directive whole — it is the actionable payload);
   returned handoffs are archive: `directive_preview`/`return_note_preview` (280 chars) + ids+titles
   snapshots. `recent_concepts` are heads (id/type/title/status/created_at) — their full summaries sit in
   `concepts_by_status`. Oversized responses (default cap 131072 bytes, `HEADWATER_MAX_RESPONSE_BYTES`)
   **degrade** to ids+titles+counts with `degraded: true` — never an error. `open_handoff`/`return_handoff`
   return slim confirmations (id, surfaces, status, timestamps, concept_ids), not the frozen snapshot.
+- `read_handoff(id)` → the handoff row with `directive`, `return_note`, and the frozen
+  `payload_snapshot` **whole** (full concept bodies). The state read previews returned handoffs;
+  this is full recall — the mirror of `read_concept`.
+- `find_concepts(project, query, limit=20)` → newest-first `ConceptSummary` matches (`body_preview` +
+  `closed_by`) via substring `LIKE` over title+body (`%`/`_` literal, limit clamped 1-100). Search
+  first; `mode:'full'` state only when everything is truly needed.
 - `open_handoff(project, from_surface, to_surface, concept_ids, directive)` → `pending` handoff with a
   frozen JSON `payload_snapshot` of the named concepts + `handoff_concept` join rows.
 - `return_handoff(handoff_id, return_note)` → `status=returned`, `returned_at=now`, `return_note`.
@@ -113,7 +128,7 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
   are not yet driven by a tool. That's intentional headroom, not dead code to remove.
 
 ## Scope fence — do NOT build (ask first if you think something is genuinely missing)
-No FTS, no vector/semantic recall, no reranking. No auth, multi-user, teams, cloud, or sync. No automatic
+No FTS, no vector/semantic recall, no reranking (`find_concepts` is plain `LIKE` — that is the ceiling). No auth, multi-user, teams, cloud, or sync. No automatic
 cross-reference discovery, no design-tool surface, no orchestration. No speculative abstractions or plugin
 layers. No graph-viz library — **except** the one recorded carve-out above (a vendored, live-viewer-only,
 `strict` Mermaid for diagrams embedded in concept bodies).

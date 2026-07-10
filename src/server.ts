@@ -1,4 +1,4 @@
-// server.ts — the six headwater MCP tools.
+// server.ts — the eight headwater MCP tools.
 //
 // The tool *logic* lives here as plain exported functions (writeConcept, forkConcept,
 // readConcept, readProjectState, openHandoff, returnHandoff). They take a Database plus a
@@ -675,7 +675,7 @@ export function callTool(db: Database, op: string, args: unknown): ToolResult {
   return result;
 }
 
-/** Register all six tools on the given server, backed by the given pool. */
+/** Register all eight tools on the given server, backed by the given pool. */
 export function registerTools(server: McpServer, db: Database): void {
   server.registerTool(
     "write_concept",
@@ -829,11 +829,12 @@ export function registerTools(server: McpServer, db: Database): void {
  */
 export const SERVER_INSTRUCTIONS = [
   "headwater records how state MOVES between AI surfaces (chats, code sessions, agents) — the handoff, not just the memory.",
-  "KICKOFF: before substantive work call read_project_state(<project>) to load prior decisions, open questions, and pending handoffs. Bodies arrive as bounded previews — read_concept(id) recalls any full text. Pin <project> per surface; never infer it from a directory name.",
+  "KICKOFF: before substantive work call read_project_state(<project>) — the default lean mode carries previews for decisions/architecture/constraints/open questions and heads for the rest; read_concept(id) recalls any full text, read_handoff(id) recalls a full handoff (frozen snapshot included). Pin <project> per surface; never infer it from a directory name.",
+  "DISCOVER: find_concepts(project, query) substring-searches titles+bodies and returns summaries — search first; request mode:'full' state only when you truly need every preview. mode:'ids' is the minimal map.",
   "CAPTURE: as durable decisions emerge call write_concept — ONLY things worth remembering across sessions (decision, architecture, constraint, open_question), never routine chatter or anything already in code/git. Short imperative title; the body states the decision AND the why. Identify yourself with a stable surface label like 'claude-code:<repo>' or 'claude-desktop:<project>'.",
   "RICH BODIES: a concept body renders a markdown subset (headings, bold/italic/inline code, http links + images, pipe tables, bullet/numbered lists, '- [ ]'/'- [x]' checklists) plus mermaid diagram blocks in the viewer — use them so a concept can express itself, not just plain prose. Cite related concepts and handoffs as [[concept-id]] (the hash suffix is optional): resolved ids render as links, dangling ones as ghosts that flag the missing node.",
   "REVISE BY FORKING: concepts are immutable — never rewrite one. fork_concept off the parent (kind supersedes / evolved_from / annotates) so history stays a linked tree. A maintained list (a task registry) is a concept kept current by supersede-forks, not an edit. CLOSURE IS DERIVED, never stored: a supersedes fork closes its parent, and a decision fork answers an open_question — kickoff and viewer then present the parent as resolved (closed_by names the fork). There is no status-update path; do not look for one.",
-  "HAND OFF: open_handoff(concept_ids + directive) passes work to another surface; return_handoff(note) closes the loop. The payload snapshot is frozen at creation.",
+  "HAND OFF: open_handoff(concept_ids + directive) passes work to another surface; return_handoff(note) closes the loop. The payload snapshot is frozen at creation; read_handoff(id) recalls it whole. Returning twice is safe: an identical note is a no-op, a different note is refused.",
   "OBSERVE: run 'bun run serve' for a local read-and-write viewer at 127.0.0.1 where the operator can browse, filter, inspect each handoff's frozen-vs-current evidence, and comment/fork/hand off from the page.",
   'Full playbook: read the concept titled "How to use headwater effectively" (surfaced by read_project_state).',
 ].join("\n\n");
