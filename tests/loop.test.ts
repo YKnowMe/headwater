@@ -319,6 +319,140 @@ test("filter bar + GET search render only in the live viewer (static stays form-
   rdb.close();
 });
 
+// --- the date window + sort order -----------------------------------------------------------------
+// Concept cards default to NEWEST-first (the fold then hides old settled work, not recent work), with
+// ?sort=oldest to flip. The date window is ONE concept with two mutually exclusive expressions: a
+// relative preset (?since=7d) or an absolute inclusive range (?from=&?to=). It scopes concepts only —
+// the lineage tree and handoff spine always render whole, exactly like the other four facets.
+
+/** Seed concepts with explicit created_at values (writeConcept always stamps "now"). */
+function seedDated(rdb: Database, rows: Array<[title: string, createdAt: string]>): void {
+  writeConcept(rdb, { project: "p", type: "note", title: "ANCHOR", body: "a", surface: "s" }); // upserts project + surface
+  for (const [title, at] of rows) {
+    rdb.run(
+      `INSERT INTO concept (id, project_id, type, title, status, body, origin_surface_id, created_at)
+       VALUES (?, 'p', 'note', ?, 'active', 'b', 's', ?)`,
+      [title.toLowerCase(), title, at],
+    );
+  }
+}
+
+const daysAgo = (n: number): string => new Date(Date.now() - n * 86_400_000).toISOString();
+
+test("concept cards are newest-first by default; ?sort=oldest flips them", () => {
+  const rdb = initDb(":memory:");
+  seedDated(rdb, [["OLDEST_CARD", "2024-01-01T00:00:00.000Z"], ["NEWER_CARD", "2026-01-01T00:00:00.000Z"]]);
+
+  const def = renderHtml(rdb);
+  expect(def.indexOf("NEWER_CARD")).toBeLessThan(def.indexOf("OLDEST_CARD")); // newest-first is the default
+
+  const flipped = renderHtml(rdb, { live: true, sort: "oldest" });
+  expect(flipped.indexOf("OLDEST_CARD")).toBeLessThan(flipped.indexOf("NEWER_CARD"));
+
+  rdb.close();
+});
+
+test("?since= narrows concepts to a relative window (cutoff computed at render time)", () => {
+  const rdb = initDb(":memory:");
+  seedDated(rdb, [["INSIDE_WINDOW", daysAgo(3)], ["OUTSIDE_WINDOW", daysAgo(60)]]);
+
+  const html = renderHtml(rdb, { live: true, filters: { since: "7d" } });
+  expect(html).toContain("INSIDE_WINDOW");
+  expect(html).not.toContain("OUTSIDE_WINDOW");
+
+  rdb.close();
+});
+
+test("?from=/?to= narrow concepts to an absolute window, inclusive on both ends", () => {
+  const rdb = initDb(":memory:");
+  seedDated(rdb, [
+    ["BEFORE_RANGE", "2026-06-30T23:59:59.000Z"],
+    ["ON_FROM_EDGE", "2026-07-01T00:00:00.000Z"],
+    ["INSIDE_RANGE", "2026-07-05T12:00:00.000Z"],
+    ["ON_TO_EDGE", "2026-07-10T23:59:59.000Z"], // same UTC day as `to` => included
+    ["AFTER_RANGE", "2026-07-11T00:00:00.000Z"],
+  ]);
+
+  const html = renderHtml(rdb, { live: true, filters: { from: "2026-07-01", to: "2026-07-10" } });
+  expect(html).toContain("ON_FROM_EDGE");
+  expect(html).toContain("INSIDE_RANGE");
+  expect(html).toContain("ON_TO_EDGE");
+  expect(html).not.toContain("BEFORE_RANGE");
+  expect(html).not.toContain("AFTER_RANGE");
+
+  rdb.close();
+});
+
+test("the window has one expression: a `since` preset supersedes an absolute range", () => {
+  const rdb = initDb(":memory:");
+  seedDated(rdb, [["RECENT_ONE", daysAgo(2)], ["ANCIENT_ONE", "2024-01-01T00:00:00.000Z"]]);
+
+  // An ambiguous URL can still be hand-typed; `since` wins so the page is never a mystery.
+  const html = renderHtml(rdb, { live: true, filters: { since: "7d", from: "2024-01-01", to: "2024-12-31" } });
+  expect(html).toContain("RECENT_ONE");
+  expect(html).not.toContain("ANCIENT_ONE");
+
+  rdb.close();
+});
+
+test("the date window scopes concepts only — the handoff spine still renders whole", async () => {
+  const rdb = initDb(":memory:");
+  const c = writeConcept(rdb, { project: "p", type: "note", title: "CARRIED", body: "c", surface: "s" });
+  openHandoff(rdb, {
+    project: "p",
+    from_surface: "a",
+    to_surface: "b",
+    concept_ids: [c.id],
+    directive: "SPINE_DIRECTIVE_MARKER",
+  });
+
+  // A window that excludes every concept must not empty the timeline.
+  const html = renderHtml(rdb, { live: true, filters: { from: "2020-01-01", to: "2020-12-31" } });
+  expect(html).not.toContain(">CARRIED<");
+  expect(html).toContain("SPINE_DIRECTIVE_MARKER");
+
+  rdb.close();
+});
+
+test("handleViewerRequest validates since/from/to/sort and ignores junk values", async () => {
+  const rdb = initDb(":memory:");
+  seedDated(rdb, [["OLD_JUNK_TEST", "2024-01-01T00:00:00.000Z"], ["NEW_JUNK_TEST", "2026-01-01T00:00:00.000Z"]]);
+
+  const get = async (qs: string) =>
+    await (await handleViewerRequest(new Request(`http://localhost/?${qs}`), rdb)).text();
+
+  // Junk is dropped, never bound: an unknown preset / malformed date / bogus sort => the default view.
+  const junk = await get("since=all-of-time&from=yesterday&to=DROP+TABLE&sort=sideways");
+  expect(junk).toContain("OLD_JUNK_TEST");
+  expect(junk).toContain("NEW_JUNK_TEST");
+  expect(junk.indexOf("NEW_JUNK_TEST")).toBeLessThan(junk.indexOf("OLD_JUNK_TEST")); // default sort held
+
+  // Valid params are honored end to end.
+  const scoped = await get("from=2025-01-01&to=2027-01-01");
+  expect(scoped).toContain("NEW_JUNK_TEST");
+  expect(scoped).not.toContain("OLD_JUNK_TEST");
+
+  rdb.close();
+});
+
+test("date + sort controls render live-only; the static file stays form-free", () => {
+  const rdb = initDb(":memory:");
+  writeConcept(rdb, { project: "p", type: "note", title: "A", body: "a", surface: "s" });
+
+  const live = renderHtml(rdb, { live: true });
+  const stat = renderHtml(rdb);
+
+  expect(live).toContain('name="from"');
+  expect(live).toContain('name="to"');
+  expect(live).toContain("since=7d");
+  expect(live).toContain("sort=oldest");
+  expect(stat).not.toContain('name="from"');
+  expect(stat).not.toContain("since=7d");
+  expect(stat).not.toContain("<form");
+
+  rdb.close();
+});
+
 test("mermaid blocks render live as <pre class=\"mermaid\"> with the script; static as a code block", () => {
   const rdb = initDb(":memory:");
   writeConcept(rdb, { project: "p", type: "note", title: "m", body: "```mermaid\ngraph TD; A-->B;\n```", surface: "s" });

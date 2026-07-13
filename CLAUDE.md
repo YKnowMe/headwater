@@ -40,6 +40,15 @@ learned*; headwater models *how it moves*. This is v1: the smallest thing that c
   `` ```mermaid `` source as a code block). The live viewer also honors **read-only** query-param filters
   (`?project=`/`?type=`/`?status=`/`?surface=`/`?q=`; `q` is a plain SQL `LIKE` substring — not FTS) via a
   live-only filter bar + GET search form; the static file is the unfiltered snapshot.
+  **Date window + sort:** concept cards are **newest-first by default** (static file included — the
+  "Show N more" fold must hide old settled work, not recent work); `?sort=oldest` flips them. The date
+  window is ONE concept with two **mutually exclusive** expressions — a relative preset (`?since=24h|7d|
+  30d|90d`, cutoff computed at render time) or an absolute inclusive range (`?from=`/`?to=`, `YYYY-MM-DD`,
+  compared as `substr(created_at,1,10)` so it is UTC-day-granular with no date functions). `since` wins
+  when both are present, so a URL always names exactly one window. Junk values are dropped, never bound.
+  Like every other facet, the window scopes **concepts only** — the lineage tree and handoff spine always
+  render whole. Sorting the spine or the tree was considered and rejected: both are settled canonical
+  representations whose order carries meaning (chronological narrative; parent → child).
   **Canonical representations (settled design — do not re-add variants):** lineage renders as ONE tree and
   handoffs as ONE vertical spine timeline; the old cards/table/SVG and tree/diagram/table switches were
   deliberately pruned. Each handoff expands in place (native `<details>`) to its evidence — frozen

@@ -241,9 +241,34 @@ function renderBody(body: string, live: boolean, resolve?: WikiResolve): string 
 // Live-only concept filters (the static render passes none). q is a plain SQL LIKE substring — NOT
 // FTS, no ranking, no highlight — so it stays inside the scope fence. type/status are validated against
 // the enums in handleViewerRequest before reaching here; all binds are parameterized.
-type Filters = { type?: string; status?: string; surface?: string; q?: string };
+//
+// The date window is ONE concept with two expressions: a relative preset (`since`) or an absolute
+// inclusive range (`from`/`to`). They are mutually exclusive — `since` wins — so a URL carrying both
+// still names exactly one window. Like every other facet, it scopes CONCEPTS only; the lineage tree and
+// handoff spine always render whole (which is also what keeps whole-pool drift/wikilink resolution honest).
+type Filters = { type?: string; status?: string; surface?: string; q?: string; since?: string; from?: string; to?: string };
 
-function loadConcepts(db: Database, f: Filters = {}): ConceptView[] {
+/** Relative window presets, in hours. The cutoff is computed at render time, so `?since=7d` keeps meaning "7d". */
+const SINCE_PRESETS: Record<string, number> = { "24h": 24, "7d": 24 * 7, "30d": 24 * 30, "90d": 24 * 90 };
+
+/** Card order. Newest-first is the default: the "Show N more" fold should hide old settled work, not recent work. */
+export type SortOrder = "newest" | "oldest";
+const SORT_ORDERS: readonly SortOrder[] = ["newest", "oldest"];
+
+const isSincePreset = (v: string): boolean => Object.hasOwn(SINCE_PRESETS, v);
+const isIsoDay = (v: string): boolean => /^\d{4}-\d{2}-\d{2}$/.test(v);
+
+function loadConcepts(db: Database, f: Filters = {}, sort: SortOrder = "newest"): ConceptView[] {
+  // `since` supersedes an absolute range, so the two expressions can never compound into a third window.
+  const since = f.since && isSincePreset(f.since) ? f.since : undefined;
+  const cutoff = since ? new Date(Date.now() - SINCE_PRESETS[since]! * 3_600_000).toISOString() : null;
+  // created_at is ISO TEXT, so its leading 10 chars ARE the UTC day — a plain string compare gives an
+  // inclusive day-granular range with no date functions and no timezone math.
+  const from = since ? null : (f.from ?? null);
+  const to = since ? null : (f.to ?? null);
+  // Interpolated, never bound: SQLite can't parameterize a direction, and the value comes from the
+  // SortOrder union (validated at the request edge), never from user text.
+  const dir = sort === "oldest" ? "ASC" : "DESC";
   return db
     .query<ConceptView, any>(
       `SELECT c.*, s.label AS origin_label, p.name AS project_name
@@ -254,13 +279,19 @@ function loadConcepts(db: Database, f: Filters = {}): ConceptView[] {
           AND ($status IS NULL OR c.status = $status)
           AND ($surface IS NULL OR c.origin_surface_id = $surface OR s.label = $surface)
           AND ($qlike IS NULL OR c.title LIKE $qlike OR c.body LIKE $qlike)
-        ORDER BY c.created_at ASC`,
+          AND ($cutoff IS NULL OR c.created_at >= $cutoff)
+          AND ($from IS NULL OR substr(c.created_at, 1, 10) >= $from)
+          AND ($to IS NULL OR substr(c.created_at, 1, 10) <= $to)
+        ORDER BY c.created_at ${dir}`,
     )
     .all({
       $type: f.type ?? null,
       $status: f.status ?? null,
       $surface: f.surface ?? null,
       $qlike: f.q ? `%${f.q}%` : null,
+      $cutoff: cutoff,
+      $from: from,
+      $to: to,
     });
 }
 
@@ -693,7 +724,7 @@ function renderProjectIndex(projects: ProjectBucket[], opts: { live?: boolean; o
 
 // --- Phase 3: live-only faceted filters + plain-LIKE search (server-side, no client JS) ------------
 
-type ViewOpts = { live?: boolean; only?: string; filters?: Filters };
+type ViewOpts = { live?: boolean; only?: string; filters?: Filters; sort?: SortOrder };
 
 function distinctSurfaces(db: Database): string[] {
   return db
@@ -704,15 +735,24 @@ function distinctSurfaces(db: Database): string[] {
     .map((r) => r.label);
 }
 
-/** Build a "/" URL preserving the current project + filters, applying one set/clear change. */
-function filterHref(opts: ViewOpts, change: Record<string, string | null>): string {
+/** Every param the viewer's read-only query state is made of — the one list filterHref and the forms share. */
+type ViewParam = "project" | "type" | "status" | "surface" | "q" | "since" | "from" | "to" | "sort";
+
+/** The current view as query params. `sort` is omitted when it's the default, so plain "/" stays clean. */
+function viewParams(opts: ViewOpts): URLSearchParams {
   const f = opts.filters ?? {};
   const p = new URLSearchParams();
   if (opts.only) p.set("project", opts.only);
-  if (f.type) p.set("type", f.type);
-  if (f.status) p.set("status", f.status);
-  if (f.surface) p.set("surface", f.surface);
-  if (f.q) p.set("q", f.q);
+  for (const k of ["type", "status", "surface", "q", "since", "from", "to"] as const) {
+    if (f[k]) p.set(k, f[k]!);
+  }
+  if (opts.sort && opts.sort !== "newest") p.set("sort", opts.sort);
+  return p;
+}
+
+/** Build a "/" URL preserving the current project + filters + sort, applying one set/clear change. */
+function filterHref(opts: ViewOpts, change: Partial<Record<ViewParam, string | null>>): string {
+  const p = viewParams(opts);
   for (const [k, v] of Object.entries(change)) {
     if (v == null) p.delete(k);
     else p.set(k, v);
@@ -721,9 +761,22 @@ function filterHref(opts: ViewOpts, change: Record<string, string | null>): stri
   return s ? `/?${s}` : "/";
 }
 
-/** Faceted chips (type/status/surface) + a GET search box — all live-only, all read-only navigation. */
+/** Hidden inputs so a GET form submit preserves the rest of the view instead of resetting it. */
+function carryParams(opts: ViewOpts, except: ViewParam[]): string {
+  const p = viewParams(opts);
+  for (const k of except) p.delete(k);
+  return [...p].map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}" />`).join("");
+}
+
+/**
+ * Faceted chips (type/status/surface/since) + a sort toggle + a date-range and a search form — all
+ * live-only, all read-only navigation. The date window has two expressions and they are exclusive:
+ * clicking a `since` chip drops from/to, and submitting the range form drops `since` (it is the one
+ * param the range form does not carry forward).
+ */
 function renderFilterBar(db: Database, opts: ViewOpts): string {
   const f = opts.filters ?? {};
+  const sort = opts.sort ?? "newest";
   const chip = (label: string, dim: "type" | "status" | "surface", val: string): string => {
     const active = f[dim] === val;
     const href = esc(filterHref(opts, { [dim]: active ? null : val }));
@@ -732,20 +785,49 @@ function renderFilterBar(db: Database, opts: ViewOpts): string {
   const types = CONCEPT_TYPES.map((t) => chip(t, "type", t)).join("");
   const statuses = CONCEPT_STATUSES.map((s) => chip(s, "status", s)).join("");
   const surfaces = distinctSurfaces(db).map((s) => chip(s, "surface", s)).join("");
-  const anyActive = f.type || f.status || f.surface || f.q;
-  const clear = anyActive ? `<a class="fchip clear" href="${esc(filterHref(opts, { type: null, status: null, surface: null, q: null }))}">clear</a>` : "";
-  const hidden = (["project", "type", "status", "surface"] as const)
-    .map((k) => {
-      const v = k === "project" ? opts.only : f[k as "type" | "status" | "surface"];
-      return v ? `<input type="hidden" name="${k}" value="${esc(v)}" />` : "";
+
+  // A `since` chip sets the relative window and clears the absolute one — one window, never two.
+  const sinces = Object.keys(SINCE_PRESETS)
+    .map((v) => {
+      const active = f.since === v;
+      const href = esc(filterHref(opts, { since: active ? null : v, from: null, to: null }));
+      return `<a class="fchip${active ? " active" : ""}" href="${href}">${esc(v)}</a>`;
     })
     .join("");
-  const search = `<form class="search" method="get" action="/"><input type="text" name="q" value="${esc(f.q ?? "")}" placeholder="search title / body" />${hidden}</form>`;
+  const sorts = SORT_ORDERS.map((o) => {
+    const active = sort === o;
+    // "newest" is the default, so selecting it drops the param rather than pinning it.
+    const href = esc(filterHref(opts, { sort: o === "newest" ? null : o }));
+    return `<a class="fchip${active ? " active" : ""}" href="${href}">${esc(o)}</a>`;
+  }).join("");
+
+  const anyActive = f.type || f.status || f.surface || f.q || f.since || f.from || f.to;
+  const clear = anyActive
+    ? `<a class="fchip clear" href="${esc(
+        filterHref(opts, { type: null, status: null, surface: null, q: null, since: null, from: null, to: null }),
+      )}">clear</a>`
+    : "";
+
+  const range = `<form class="range" method="get" action="/"><input type="date" name="from" value="${esc(
+    f.from ?? "",
+  )}" aria-label="from date" /><span class="rdash">&ndash;</span><input type="date" name="to" value="${esc(
+    f.to ?? "",
+  )}" aria-label="to date" />${carryParams(opts, ["from", "to", "since"])}<button type="submit">apply</button></form>`;
+  const search = `<form class="search" method="get" action="/"><input type="text" name="q" value="${esc(
+    f.q ?? "",
+  )}" placeholder="search title / body" />${carryParams(opts, ["q"])}</form>`;
+
   return `<nav class="filter-bar">
       <span class="flabel">type</span>${types}
       <span class="flabel">status</span>${statuses}
       ${surfaces ? `<span class="flabel">surface</span>${surfaces}` : ""}
-      ${search}${clear}
+      ${search}
+    </nav>
+    <nav class="filter-bar">
+      <span class="flabel">since</span>${sinces}
+      <span class="flabel">range</span>${range}
+      <span class="flabel">sort</span>${sorts}
+      ${clear}
     </nav>`;
 }
 
@@ -919,6 +1001,15 @@ const STYLE = `
   .filter-bar .search { display: inline-flex; margin-left: auto; }
   .filter-bar .search input { font: inherit; font-size: 12.5px; padding: 3px 11px;
     border: 1px solid var(--line); border-radius: 999px; min-width: 170px; }
+  /* The date window's absolute expression: native date inputs, no client JS, no date picker library. */
+  .filter-bar .range { display: inline-flex; align-items: center; gap: 5px; }
+  .filter-bar .range input { font: inherit; font-size: 12px; padding: 2px 8px;
+    border: 1px solid var(--line); border-radius: 999px; background: var(--panel); color: var(--ink); }
+  .filter-bar .range .rdash { color: var(--muted); }
+  .filter-bar .range button { cursor: pointer; font: inherit; font-size: 12px; font-weight: 600;
+    padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--accent); }
+  .filter-bar .range button:hover { border-color: var(--accent); }
   details.project { border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
     padding: 4px 20px 12px; margin: 22px 0; }
   details.project > summary { font-size: 18px; font-weight: 700; cursor: pointer; list-style: none;
@@ -1018,7 +1109,7 @@ const STYLE = `
  * which re-renders it. The static `bun run render` output omits the button (pure HTML/CSS).
  */
 export function renderHtml(db: Database, opts: ViewOpts = {}): string {
-  const concepts = loadConcepts(db, opts.filters ?? {});
+  const concepts = loadConcepts(db, opts.filters ?? {}, opts.sort ?? "newest");
   const lineage = loadLineage(db);
   const handoffs = loadHandoffs(db);
   const refreshButton = opts.live
@@ -1210,15 +1301,31 @@ export async function handleViewerRequest(req: Request, db: Database): Promise<R
     const only = sp.get("project") ?? undefined;
     const type = sp.get("type");
     const status = sp.get("status");
+    // The date window: `since` against the preset table, from/to against a strict YYYY-MM-DD shape.
+    // Junk is dropped (never bound, never echoed as a filter) — a mistyped param yields the default
+    // view rather than an error page, matching how type/status already behave.
+    const since = sp.get("since");
+    const from = sp.get("from");
+    const to = sp.get("to");
+    const sort = sp.get("sort");
     const filters: Filters = {
       type: type && (CONCEPT_TYPES as readonly string[]).includes(type) ? type : undefined,
       status: status && (CONCEPT_STATUSES as readonly string[]).includes(status) ? status : undefined,
       surface: sp.get("surface") ?? undefined,
       q: sp.get("q")?.trim() || undefined,
+      since: since && isSincePreset(since) ? since : undefined,
+      from: from && isIsoDay(from) ? from : undefined,
+      to: to && isIsoDay(to) ? to : undefined,
     };
-    return new Response(renderHtml(db, { live: true, only, filters }), {
-      headers: { "content-type": "text/html; charset=utf-8" },
-    });
+    return new Response(
+      renderHtml(db, {
+        live: true,
+        only,
+        filters,
+        sort: sort && (SORT_ORDERS as readonly string[]).includes(sort) ? (sort as SortOrder) : "newest",
+      }),
+      { headers: { "content-type": "text/html; charset=utf-8" } },
+    );
   }
   return new Response("not found", { status: 404 });
 }
